@@ -1,0 +1,19 @@
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+build/
+dist/
+*.egg-info/
+
+# キャプチャファイル(実データの流出防止)
+*.pcap
+*.pcapng
+*.cap
+
+# エディタ・OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
