@@ -99,14 +99,17 @@ Caveats
 from __future__ import annotations
 
 import abc
+import bisect
 import collections
 import functools
+import ipaddress
 import logging
 import os
+import re
 import socket
 import struct
 from dataclasses import dataclass
-from typing import BinaryIO, Dict, Iterable, List, Optional, Tuple
+from typing import Any, BinaryIO, Callable, Dict, Iterable, List, Optional, Tuple
 
 __all__ = [
     "FlowId",
@@ -119,6 +122,10 @@ __all__ = [
     "TCPConversation",
     "BaseAnalyzer",
     "PcapStreamProcessor",
+    "PcapFormatError",
+    "AnalyzerError",
+    "FilterSyntaxError",
+    "compile_filter",
     "EVICT_FIN",
     "EVICT_RST",
     "EVICT_NEW_CONNECTION",
@@ -129,7 +136,7 @@ __all__ = [
     "EVICT_MAX_TOTAL_BYTES",
     "EVICT_FLUSH",
 ]
-__version__ = "0.0.1"
+__version__ = "0.1.0"
 
 # -------------------------------------------------------------------------
 # Constants
@@ -229,7 +236,27 @@ EVICT_FLUSH = "flush"                    # Explicit stream flush (e.g. EOF)
 
 FlowId = Tuple[str, int, str, int]       # (src_ip, src_port, dst_ip, dst_port)
 Endpoint = Tuple[bytes, int]              # Internal key format: (raw_ip_bytes, port)
+# Internal packet predicate: (ip_proto, src_raw, src_port, dst_raw, dst_port) -> keep?
+_PacketPredicate = Callable[[int, bytes, int, bytes, int], bool]
 logger = logging.getLogger(__name__)
+
+
+class PcapFormatError(ValueError):
+    """Raised when an input is not a readable classic PCAP file.
+
+    Subclasses `ValueError`, so code written for 0.0.x (`except ValueError`) keeps working.
+    """
+
+
+class AnalyzerError(Exception):
+    """Raised (only when `raise_on_analyzer_error=True`) if an analyzer callback fails.
+
+    The original exception is available as `__cause__`.
+    """
+
+
+class FilterSyntaxError(ValueError):
+    """Raised when a `filter_expr` cannot be parsed or uses an unsupported construct."""
 
 
 def ns_to_seconds(timestamp_ns: int) -> float:
@@ -289,6 +316,9 @@ class TCPFlowMeta:
         gaps: Sequence gaps `[(offset, missing_bytes), ...]`. Offset indicates position in `data`.
         is_closed: True if a FIN or RST was observed in this direction.
         evict_reason: Reason string for stream eviction (`EVICT_*` constants).
+        truncated_segments: Number of segments whose IP packet was cut short by the
+            capture's snaplen. Their payload is incomplete, so the resulting `gaps` may be
+            caused by truncation rather than packet loss. (Added in 0.1.0.)
     """
 
     first_timestamp_ns: int
@@ -299,6 +329,7 @@ class TCPFlowMeta:
     gaps: List[Tuple[int, int]]
     is_closed: bool
     evict_reason: str
+    truncated_segments: int = 0
 
     @property
     def gap_count(self) -> int:
@@ -387,9 +418,10 @@ _SUPPORTED_LINKTYPES = {
     DLT_LINUX_SLL, DLT_LINUX_SLL2, DLT_IPV4, DLT_IPV6,
 }
 
-# Return type structure for IP parser: (src_raw, dst_raw, proto, l4_data, fragment_info)
+# Return type structure for IP parser:
+# (src_raw, dst_raw, proto, l4_data, fragment_info, truncated_by_snaplen)
 _Fragment = Tuple[int, int, bool]
-_ParsedIP = Tuple[bytes, bytes, int, bytes, Optional[_Fragment]]
+_ParsedIP = Tuple[bytes, bytes, int, bytes, Optional[_Fragment], bool]
 
 
 def _parse_ipv4(ip_packet: bytes) -> Optional[_ParsedIP]:
@@ -410,14 +442,20 @@ def _parse_ipv4(ip_packet: bytes) -> Optional[_ParsedIP]:
         identification = struct.unpack_from("!H", ip_packet, IPV4_ID_OFFSET)[0]
         fragment = (identification, fragment_offset, more_fragments)
 
-    # Truncate payload to IP total length to eliminate Ethernet trailer padding
-    end = ip_total_len if ip_header_len <= ip_total_len <= len(ip_packet) else len(ip_packet)
+    # Truncate payload to IP total length to eliminate Ethernet trailer padding.
+    # A total length larger than the captured bytes means the capture's snaplen cut the
+    # packet short (a total length of 0 is TSO/GSO offload and is not truncation).
+    if ip_header_len <= ip_total_len <= len(ip_packet):
+        end, truncated = ip_total_len, False
+    else:
+        end, truncated = len(ip_packet), ip_total_len > len(ip_packet)
     return (
         ip_packet[IPV4_SRC_OFFSET:IPV4_SRC_OFFSET + 4],
         ip_packet[IPV4_DST_OFFSET:IPV4_DST_OFFSET + 4],
         ip_packet[IPV4_PROTO_OFFSET],
         ip_packet[ip_header_len:end],
         fragment,
+        truncated,
     )
 
 
@@ -427,7 +465,9 @@ def _parse_ipv6(ip_packet: bytes) -> Optional[_ParsedIP]:
         return None
     ip_payload_len = struct.unpack_from("!H", ip_packet, IPV6_PAYLOAD_LEN_OFFSET)[0]
     end = IPV6_HEADER_LEN + ip_payload_len
+    truncated = False
     if ip_payload_len == 0 or end > len(ip_packet):  # Handle jumbo payloads / TSO
+        truncated = ip_payload_len != 0  # payload_len 0 is jumbo/TSO; otherwise snaplen cut it
         end = len(ip_packet)
 
     src_raw = ip_packet[IPV6_SRC_OFFSET:IPV6_SRC_OFFSET + 16]
@@ -443,7 +483,10 @@ def _parse_ipv6(ip_packet: bytes) -> Optional[_ParsedIP]:
             frag_field, identification = struct.unpack_from("!HI", ip_packet, offset + 2)
             if frag_field & IPV6_FRAG_NONTRIVIAL_MASK:
                 fragment = (identification, (frag_field >> 3) * 8, bool(frag_field & 1))
-                return src_raw, dst_raw, ip_packet[offset], ip_packet[offset + IPV6_FRAG_HEADER_LEN:end], fragment
+                return (
+                    src_raw, dst_raw, ip_packet[offset],
+                    ip_packet[offset + IPV6_FRAG_HEADER_LEN:end], fragment, truncated,
+                )
             ext_len = IPV6_FRAG_HEADER_LEN  # Atomic fragment: proceed as normal header
         elif next_header == IPV6_EXT_AH:
             ext_len = (ip_packet[offset + 1] + 2) * 4
@@ -454,7 +497,7 @@ def _parse_ipv6(ip_packet: bytes) -> Optional[_ParsedIP]:
 
     if offset > end:
         return None
-    return src_raw, dst_raw, next_header, ip_packet[offset:end], None
+    return src_raw, dst_raw, next_header, ip_packet[offset:end], None, truncated
 
 
 def _parse_tcp(l4_data: bytes) -> Optional[Tuple[int, int, int, int, bytes]]:
@@ -493,29 +536,101 @@ def _parse_global_header(global_header: bytes) -> Optional[Tuple[str, int, bool]
     return endian, network & LINKTYPE_MASK, is_nano
 
 
+def _describe_bad_header(global_header: bytes) -> str:
+    """Build the error message for an unreadable global header, with a hint where possible.
+
+    The message always starts with "Invalid pcap global header" (kept from 0.0.x).
+    """
+    magic = global_header[:4]
+    message = f"Invalid pcap global header: {magic.hex()}"
+    if magic == b"\x0a\x0d\x0d\x0a":
+        return (
+            message + " (this looks like a pcapng file, which is not supported; "
+            "save it as classic pcap or convert it: editcap -F pcap in.pcapng out.pcap)"
+        )
+    if magic[:2] == b"\x1f\x8b":
+        return message + " (this looks like a gzip-compressed file; decompress it first, or pass gzip.open(path, 'rb') to process_stream)"
+    if len(global_header) < PCAP_GLOBAL_HEADER_LEN:
+        return message + f" (file too short: {len(global_header)} bytes)"
+    if len(magic) == 4 and struct.unpack_from("<I", magic)[0] in _MAGIC_TABLE:
+        return message + " (unsupported pcap version)"
+    return message
+
+
 # -------------------------------------------------------------------------
 # IP Fragment Reassembly State
 # -------------------------------------------------------------------------
+class _Intervals:
+    """Sorted, disjoint, merged half-open integer intervals.
+
+    Used to track which byte ranges have been received so that "is everything up to X
+    present?" is answered incrementally (O(log n) per insertion) instead of re-sorting
+    every buffered piece on each packet.
+    """
+
+    __slots__ = ("starts", "ends")
+
+    def __init__(self) -> None:
+        self.starts: List[int] = []
+        self.ends: List[int] = []
+
+    def add(self, start: int, end: int) -> bool:
+        """Add `[start, end)`. Returns True if it covered any byte not covered before."""
+        if end <= start:
+            return False
+        starts, ends = self.starts, self.ends
+        if not ends or start > ends[-1]:  # Fast path: in-order data after a gap/at the start
+            starts.append(start)
+            ends.append(end)
+            return True
+        if start == ends[-1]:  # Fast path: directly extends the last interval
+            ends[-1] = end
+            return True
+        lo = bisect.bisect_left(ends, start)    # First interval touching/overlapping `start`
+        hi = bisect.bisect_right(starts, end)   # Intervals [lo, hi) touch/overlap `end`
+        if lo < hi:
+            if hi - lo == 1 and starts[lo] <= start and ends[lo] >= end:
+                return False  # Already fully covered
+            new_start = min(start, starts[lo])
+            new_end = max(end, ends[hi - 1])
+            starts[lo:hi] = [new_start]
+            ends[lo:hi] = [new_end]
+        else:
+            starts.insert(lo, start)
+            ends.insert(lo, end)
+        return True
+
+    def reach(self, base: int) -> int:
+        """End of the contiguous coverage that contains `base` (or `base` if none does)."""
+        index = bisect.bisect_right(self.starts, base) - 1
+        if index >= 0 and self.ends[index] > base:
+            return self.ends[index]
+        return base
+
+
 class _FragmentSet:
     """Container for fragments belonging to a single IP datagram."""
 
-    __slots__ = ("pieces", "total_len", "size", "last_timestamp_ns")
+    __slots__ = ("pieces", "total_len", "size", "last_timestamp_ns", "cover", "truncated")
 
     def __init__(self, timestamp_ns: int):
-        self.pieces: List[Tuple[int, bytes]] = []  # [(offset, payload_bytes)]
+        self.pieces: List[Tuple[int, bytes]] = []  # [(offset, payload_bytes)] (new coverage only)
         self.total_len: Optional[int] = None      # Resolved when final fragment arrives
-        self.size = 0                             # Total buffered bytes including overlaps
+        self.size = 0                             # Total buffered bytes
         self.last_timestamp_ns = timestamp_ns
+        self.cover = _Intervals()                 # Byte ranges received so far
+        self.truncated = False                    # Any piece was cut short by snaplen
 
 
 class _FragmentReassembler:
     """Manages state for IPv4 and IPv6 fragment reassembly."""
 
-    def __init__(self, timeout_ns: int, max_sets: int, stats: collections.Counter):
+    def __init__(self, timeout_ns: int, max_sets: int, stats: "collections.Counter[str]"):
         self._timeout_ns = timeout_ns
         self._max_sets = max_sets
         self._stats = stats
-        self._sets: "collections.OrderedDict[tuple, _FragmentSet]" = collections.OrderedDict()
+        self._sets: "collections.OrderedDict[Tuple[Any, ...], _FragmentSet]" = collections.OrderedDict()
+        self.last_truncated = False  # Whether the most recently assembled datagram had a cut-short piece
 
     def expire(self, now_ns: int) -> None:
         """Evict incomplete fragment sets that have exceeded the timeout limit."""
@@ -527,9 +642,15 @@ class _FragmentReassembler:
             self._stats["frag_expired"] += 1
 
     def add(
-        self, key: tuple, offset: int, more_fragments: bool, data: bytes, timestamp_ns: int
+        self, key: Tuple[Any, ...], offset: int, more_fragments: bool, data: bytes,
+        timestamp_ns: int, truncated: bool = False,
     ) -> Optional[bytes]:
-        """Add a fragment piece and return reassembled L4 payload if complete."""
+        """Add a fragment piece and return reassembled L4 payload if complete.
+
+        Pieces that add no new byte range (duplicates, fully overlapped) are not stored, so
+        the earliest-received bytes win and buffered size stays bounded. `last_truncated`
+        reports, after a successful return, whether any piece was cut short by snaplen.
+        """
         self.expire(timestamp_ns)
         if offset + len(data) > IP_MAX_DATAGRAM_LEN:
             self._stats["frag_too_large"] += 1
@@ -547,8 +668,11 @@ class _FragmentReassembler:
             self._sets.move_to_end(key)
 
         fragment_set.last_timestamp_ns = timestamp_ns
-        fragment_set.pieces.append((offset, data))
-        fragment_set.size += len(data)
+        if truncated:
+            fragment_set.truncated = True
+        if fragment_set.cover.add(offset, offset + len(data)):
+            fragment_set.pieces.append((offset, data))
+            fragment_set.size += len(data)
 
         if not more_fragments:
             end = offset + len(data)
@@ -566,8 +690,17 @@ class _FragmentReassembler:
         if fragment_set.total_len is None:
             return None
 
+        # Only assemble once the received ranges are known to cover [0, total_len).
+        # (Previously every arriving piece triggered a full sort: quadratic in piece count.)
+        cover = fragment_set.cover
+        if fragment_set.total_len > 0 and (
+            not cover.starts or cover.starts[0] != 0 or cover.ends[0] < fragment_set.total_len
+        ):
+            return None
+
         assembled = self._try_assemble(fragment_set)
         if assembled is not None:
+            self.last_truncated = fragment_set.truncated
             del self._sets[key]
         return assembled
 
@@ -608,9 +741,15 @@ class _TCPReassembler:
         self.is_rst = False
         self.first_timestamp_ns: Optional[int] = None
         self.last_timestamp_ns = 0
+        self.syn_raw: Optional[int] = None  # Raw ISN of the SYN seen in this direction
+        self.truncated_segments = 0
         self._ref_raw_seq: Optional[int] = None
         self._ref_unwrapped_seq = 0
         self._finished_cache: Optional[bool] = None
+        # Byte ranges received, built lazily the first time FIN-completeness is checked and
+        # then updated incrementally (see `_covers_up_to_fin`).
+        self._cover: Optional[_Intervals] = None
+        self._cover_n = 0  # Number of `chunks` already folded into `_cover`
 
     @property
     def has_data(self) -> bool:
@@ -628,7 +767,7 @@ class _TCPReassembler:
         self._ref_unwrapped_seq = unwrapped_seq
         return unwrapped_seq
 
-    def add(self, seq: int, payload: bytes, timestamp_ns: int, flags: int) -> int:
+    def add(self, seq: int, payload: bytes, timestamp_ns: int, flags: int, truncated: bool = False) -> int:
         """Add a TCP segment and return the byte length added to the buffer."""
         if self.first_timestamp_ns is None:
             self.first_timestamp_ns = timestamp_ns
@@ -639,10 +778,13 @@ class _TCPReassembler:
         if flags & TCP_SYN:
             data_seq += 1
             self.start_seq = data_seq
+            self.syn_raw = seq
 
         if payload:
             self.chunks.append((data_seq, payload, timestamp_ns))
             self._finished_cache = None
+            if truncated:
+                self.truncated_segments += 1
 
         if flags & TCP_FIN:
             self.fin_seq = data_seq + len(payload)
@@ -664,22 +806,29 @@ class _TCPReassembler:
         return self._finished_cache
 
     def _covers_up_to_fin(self) -> bool:
-        """Verify contiguity from start_seq up to fin_seq."""
-        assert self.fin_seq is not None
-        spans = sorted((seq, seq + len(payload)) for seq, payload, _ in self.chunks)
-        if self.start_seq is not None:
-            covered = self.start_seq
-        elif spans:
-            covered = spans[0][0]
-        else:
-            covered = self.fin_seq
+        """Verify contiguity from start_seq (or the lowest seen byte) up to fin_seq.
 
-        for start, end in spans:
-            if start > covered:
-                return False
-            if end > covered:
-                covered = end
-        return covered >= self.fin_seq
+        Coverage is kept as merged intervals and only newly arrived chunks are folded in on
+        each call, so a stream that keeps receiving segments after a FIN (e.g. while a gap
+        stays unfilled) costs O(log n) per segment rather than a full re-sort each time.
+        """
+        assert self.fin_seq is not None
+        cover = self._cover
+        if cover is None:
+            cover = self._cover = _Intervals()
+        chunks = self.chunks
+        for index in range(self._cover_n, len(chunks)):
+            seq, payload, _ = chunks[index]
+            cover.add(seq, seq + len(payload))
+        self._cover_n = len(chunks)
+
+        if self.start_seq is not None:
+            base = self.start_seq
+        elif cover.starts:
+            base = cover.starts[0]
+        else:
+            base = self.fin_seq
+        return cover.reach(base) >= self.fin_seq
 
     def reassemble(self) -> Tuple[bytes, List[Tuple[int, bytes]], List[Tuple[int, int]], int]:
         """Order segments by sequence number, trim overlaps, and construct contiguous data.
@@ -725,6 +874,8 @@ class _TCPReassembler:
 
     def clear(self) -> None:
         self.chunks.clear()
+        self._cover = None
+        self._cover_n = 0
 
 
 class _TCPConversation:
@@ -767,6 +918,259 @@ class _TCPConversation:
             return EVICT_FIN
         return None
 
+    def has_any_data(self) -> bool:
+        """True if payload has been buffered in either direction."""
+        return self.directions[0].has_data or self.directions[1].has_data
+
+    def fully_closing(self) -> bool:
+        """True if every direction that was seen has sent FIN or RST.
+
+        A conversation where only one side has closed is a half-close: the other side may
+        legitimately keep sending for a long time, so it must not be timed out as "closing".
+        """
+        for index in (0, 1):
+            direction = self.directions[index]
+            if self.seen[index] and direction.fin_seq is None and not direction.is_rst:
+                return False
+        return True
+
+
+# -------------------------------------------------------------------------
+# tcpdump-style filter expressions
+# -------------------------------------------------------------------------
+_FILTER_TOKEN_RE = re.compile(r"\s+|(&&|\|\||[()!]|[^\s()!&|]+)|(.)")
+_FILTER_AND = ("and", "&&")
+_FILTER_OR = ("or", "||")
+_FILTER_NOT = ("not", "!")
+_FILTER_PROTOS = ("tcp", "udp", "ip", "ip6")
+_FILTER_TYPES = ("host", "net", "port", "portrange")
+_FILTER_SUPPORTED_HELP = (
+    "supported: tcp, udp, ip, ip6, [src|dst|src or dst|src and dst] host/net/port/portrange, "
+    "and, or, not, parentheses"
+)
+
+
+def _filter_directional(direction: Optional[str], match: Callable[[Any], bool]) -> Callable[[Any, Any], bool]:
+    """Apply `match` to (source, destination) according to the direction qualifier."""
+    if direction == "src":
+        return lambda a, b: match(a)
+    if direction == "dst":
+        return lambda a, b: match(b)
+    if direction == "both":
+        return lambda a, b: match(a) and match(b)
+    return lambda a, b: match(a) or match(b)
+
+
+def _filter_proto_test(proto: Optional[str]) -> Optional[_PacketPredicate]:
+    if proto is None:
+        return None
+    if proto == "tcp":
+        return lambda p, s, sp, d, dp: p == IPPROTO_TCP
+    if proto == "udp":
+        return lambda p, s, sp, d, dp: p == IPPROTO_UDP
+    if proto == "ip":
+        return lambda p, s, sp, d, dp: len(s) == 4
+    return lambda p, s, sp, d, dp: len(s) == 16  # "ip6"
+
+
+def _filter_primitive(proto: Optional[str], direction: Optional[str], ptype: str, literal: str) -> _PacketPredicate:
+    """Compile one `[proto] [dir] type value` primitive into a packet predicate."""
+    core: _PacketPredicate
+    if ptype in ("host", "net"):
+        try:
+            if ptype == "host":
+                packed = ipaddress.ip_address(literal).packed
+                addr_match: Callable[[bytes], bool] = lambda raw: raw == packed  # noqa: E731
+            else:
+                if "/" not in literal:
+                    raise FilterSyntaxError(f"net {literal!r}: write the network in CIDR form, e.g. 10.0.0.0/8")
+                network = ipaddress.ip_network(literal, strict=True)
+                net_len = network.max_prefixlen // 8
+                net_int, mask = int(network.network_address), int(network.netmask)
+                addr_match = lambda raw: len(raw) == net_len and (int.from_bytes(raw, "big") & mask) == net_int  # noqa: E731
+        except ValueError as error:  # includes FilterSyntaxError raised above (it is a ValueError)
+            if isinstance(error, FilterSyntaxError):
+                raise
+            raise FilterSyntaxError(
+                f"{ptype} {literal!r}: only literal IP addresses/CIDR networks are supported "
+                f"(no hostnames or DNS lookups): {error}"
+            ) from error
+        by_addr = _filter_directional(direction, addr_match)
+        core = lambda p, s, sp, d, dp: by_addr(s, d)  # noqa: E731
+    else:
+        try:
+            if ptype == "port":
+                low = high = int(literal)
+            else:
+                low_text, separator, high_text = literal.partition("-")
+                if not separator:
+                    raise ValueError("expected LOW-HIGH")
+                low, high = int(low_text), int(high_text)
+        except ValueError:
+            raise FilterSyntaxError(
+                f"{ptype} {literal!r}: expected a numeric "
+                + ("port number (service names are not supported)" if ptype == "port" else "range like 8000-8100")
+            ) from None
+        if not (0 <= low <= high <= 65535):
+            raise FilterSyntaxError(f"{ptype} {literal!r}: ports must satisfy 0 <= low <= high <= 65535")
+        by_port = _filter_directional(direction, lambda port: low <= port <= high)
+        core = lambda p, s, sp, d, dp: by_port(sp, dp)  # noqa: E731
+
+    proto_test = _filter_proto_test(proto)
+    if proto_test is None:
+        return core
+    return lambda p, s, sp, d, dp: proto_test(p, s, sp, d, dp) and core(p, s, sp, d, dp)
+
+
+class _FilterParser:
+    """Recursive-descent parser turning a tcpdump-style expression into a predicate."""
+
+    def __init__(self, text: str) -> None:
+        self.tokens: List[str] = []
+        for match in _FILTER_TOKEN_RE.finditer(text):
+            if match.group(2) is not None:
+                raise FilterSyntaxError(f"unexpected character {match.group(2)!r} in filter expression")
+            if match.group(1) is not None:
+                self.tokens.append(match.group(1))
+        self.pos = 0
+        # Qualifiers of the previous primitive, so "port 80 or 443" means "port 80 or port 443"
+        self.last_qualifiers: Optional[Tuple[Optional[str], Optional[str], str]] = None
+
+    def parse(self) -> _PacketPredicate:
+        if not self.tokens:
+            return lambda p, s, sp, d, dp: True  # Like tcpdump, an empty expression matches everything
+        node = self._expression()
+        if self.pos != len(self.tokens):
+            raise FilterSyntaxError(f"unexpected {self.tokens[self.pos]!r} in filter expression")
+        return node
+
+    def _peek(self, offset: int = 0) -> Optional[str]:
+        index = self.pos + offset
+        return self.tokens[index].lower() if index < len(self.tokens) else None
+
+    def _expression(self) -> _PacketPredicate:
+        left = self._unary()
+        operator: Optional[str] = None
+        while True:
+            token = self._peek()
+            if token in _FILTER_AND:
+                current = "and"
+            elif token in _FILTER_OR:
+                current = "or"
+            else:
+                return left
+            if operator is not None and operator != current:
+                raise FilterSyntaxError(
+                    "mixing 'and' and 'or' without parentheses is ambiguous (tcpdump treats them as "
+                    "equal precedence, left to right); add parentheses"
+                )
+            operator = current
+            self.pos += 1
+            right = self._unary()
+            left = self._combine(operator, left, right)
+
+    @staticmethod
+    def _combine(operator: str, left: _PacketPredicate, right: _PacketPredicate) -> _PacketPredicate:
+        if operator == "and":
+            return lambda p, s, sp, d, dp: left(p, s, sp, d, dp) and right(p, s, sp, d, dp)
+        return lambda p, s, sp, d, dp: left(p, s, sp, d, dp) or right(p, s, sp, d, dp)
+
+    def _unary(self) -> _PacketPredicate:
+        token = self._peek()
+        if token in _FILTER_NOT:
+            self.pos += 1
+            inner = self._unary()
+            return lambda p, s, sp, d, dp: not inner(p, s, sp, d, dp)
+        if token == "(":
+            self.pos += 1
+            node = self._expression()
+            if self._peek() != ")":
+                raise FilterSyntaxError("missing closing parenthesis in filter expression")
+            self.pos += 1
+            return node
+        return self._primitive()
+
+    def _is_operator(self, token: Optional[str]) -> bool:
+        return token is None or token in _FILTER_AND + _FILTER_OR + _FILTER_NOT + ("(", ")")
+
+    def _literal(self, context: str) -> str:
+        if self._is_operator(self._peek()):
+            raise FilterSyntaxError(f"expected a value after {context!r} in filter expression")
+        literal = self.tokens[self.pos]
+        self.pos += 1
+        return literal
+
+    def _primitive(self) -> _PacketPredicate:
+        token = self._peek()
+        if self._is_operator(token):
+            raise FilterSyntaxError("unexpected end or operator in filter expression; expected a primitive")
+        proto: Optional[str] = None
+        direction: Optional[str] = None
+
+        if token in _FILTER_PROTOS:
+            proto = token
+            self.pos += 1
+            token = self._peek()
+        if token in ("src", "dst"):
+            direction = token
+            self.pos += 1
+            partner = "dst" if direction == "src" else "src"
+            if direction == "src" and self._peek() in _FILTER_AND + _FILTER_OR and self._peek(1) == partner:
+                direction = "both" if self._peek() in _FILTER_AND else "either"
+                self.pos += 2
+            token = self._peek()
+
+        if token in _FILTER_TYPES:
+            ptype = str(token)
+            self.pos += 1
+            literal = self._literal(ptype)
+        elif proto is not None and direction is None and self._is_operator(token):
+            node = _filter_proto_test(proto)
+            assert node is not None
+            return node  # Bare protocol primitive such as "tcp"
+        elif proto is None and direction is None and self.last_qualifiers is not None:
+            # Implicit qualifiers: "host a or b" means "host a or host b"
+            proto, direction, ptype = self.last_qualifiers
+            literal = self._literal(ptype)
+        else:
+            bad = self.tokens[self.pos] if self.pos < len(self.tokens) else "end of expression"
+            raise FilterSyntaxError(f"unsupported or unexpected {bad!r} in filter expression ({_FILTER_SUPPORTED_HELP})")
+
+        self.last_qualifiers = (proto, direction, ptype)
+        return _filter_primitive(proto, direction, ptype, literal)
+
+
+def compile_filter(expression: str) -> _PacketPredicate:
+    """Compile a tcpdump-style filter expression into a packet predicate. (Added in 0.1.0.)
+
+    This is a deliberately small subset of tcpdump / pcap-filter syntax, evaluated on parsed
+    TCP/UDP packets (not compiled to BPF)::
+
+        [tcp|udp|ip|ip6]                              protocol
+        [tcp|udp|ip|ip6] [src|dst|src or dst|src and dst] host  <IP address>
+        [tcp|udp|ip|ip6] [src|dst|src or dst|src and dst] net   <CIDR, e.g. 10.0.0.0/8>
+        [tcp|udp|ip|ip6] [src|dst|src or dst|src and dst] port  <number>
+        [tcp|udp|ip|ip6] [src|dst|src or dst|src and dst] portrange <low>-<high>
+        not / !,  and / &&,  or / ||,  ( ... )
+
+    Differences from tcpdump, by design: hostnames and service names are not resolved (use
+    IP literals and port numbers); mixing `and` with `or` at one level without parentheses is
+    rejected instead of being evaluated left to right; `net` needs CIDR notation; `ether`,
+    `vlan`, byte-offset expressions such as `tcp[13]`, `less`/`greater` and other protocols
+    are not supported and raise `FilterSyntaxError`. Like tcpdump, `port 80` without a
+    protocol matches both TCP and UDP, and `port 80 or 443` reuses the previous qualifiers.
+    Non-first IP fragments carry no port, so the filter is applied after fragment
+    reassembly (tcpdump's `port` does not match such fragments at all).
+
+    Returns:
+        A function `f(ip_proto, src_raw, src_port, dst_raw, dst_port) -> bool` where the
+        addresses are packed bytes (4 bytes for IPv4, 16 for IPv6).
+
+    Raises:
+        FilterSyntaxError: If the expression is invalid or uses an unsupported construct.
+    """
+    return _FilterParser(expression).parse()
+
 
 # -------------------------------------------------------------------------
 # Public API
@@ -775,8 +1179,16 @@ class BaseAnalyzer(abc.ABC):
     """Abstract base class for custom packet analyzers.
 
     Subclass `BaseAnalyzer` and override the callbacks corresponding to desired events.
-    Exceptions raised within callbacks are logged and swallowed to prevent pipeline failure.
+    By default, exceptions raised within callbacks are logged and swallowed to prevent
+    pipeline failure (set `raise_on_analyzer_error=True` on the processor to raise
+    `AnalyzerError` instead).
     """
+
+    def on_file_start(self, path: str) -> None:
+        """Invoked before a file (or stream) starts being read. (Added in 0.1.0.)"""
+
+    def on_file_end(self, path: str) -> None:
+        """Invoked after a file (or stream) has been read, before any final flush. (Added in 0.1.0.)"""
 
     def on_tcp_stream(self, flow_id: FlowId, data: bytes, meta: TCPFlowMeta) -> None:
         """Invoked for each non-empty unidirectional TCP stream upon eviction."""
@@ -808,6 +1220,20 @@ class PcapStreamProcessor:
         reassemble_fragments: Whether to reassemble IP fragments.
         fragment_timeout: Seconds before incomplete IP fragment sets expire.
         max_fragment_sets: Max concurrent incomplete fragment sets held in memory.
+        raise_on_analyzer_error: Raise `AnalyzerError` when an analyzer callback fails instead
+            of logging and continuing. (Added in 0.1.0.)
+        segment_overhead_bytes: Bytes added to the buffer accounting of every buffered
+            segment, on top of its payload, when checking `max_conversation_bytes` and
+            `max_total_bytes`. Many tiny segments use far more memory than their payload
+            suggests; a value around 100 makes the limits track real memory. Default 0
+            keeps the 0.0.x behaviour (payload bytes only). (Added in 0.1.0.)
+        packet_filter: Optional callable `f(ip_proto, flow_id) -> bool`, called for every
+            TCP/UDP packet (after IP fragment reassembly). Return False to drop the packet
+            before any stream state is created. `ip_proto` is 6 (TCP) or 17 (UDP).
+            (Added in 0.1.0.)
+        filter_expr: Optional tcpdump-style expression, e.g. `"tcp and port 80"`; see
+            `compile_filter` for the supported subset. Combined with `packet_filter` by AND.
+            (Added in 0.1.0.)
     """
 
     def __init__(
@@ -822,12 +1248,22 @@ class PcapStreamProcessor:
         reassemble_fragments: bool = True,
         fragment_timeout: float = 30.0,
         max_fragment_sets: int = 1024,
+        raise_on_analyzer_error: bool = False,
+        segment_overhead_bytes: int = 0,
+        packet_filter: Optional[Callable[[int, FlowId], bool]] = None,
+        filter_expr: Optional[str] = None,
     ):
         if max_conversations < 1:
             raise ValueError("max_conversations must be >= 1")
+        if segment_overhead_bytes < 0:
+            raise ValueError("segment_overhead_bytes must be >= 0")
         self.analyzers = analyzers or []
         self.evict_on_fin = evict_on_fin
-        self.stats: collections.Counter = collections.Counter()
+        self.stats: "collections.Counter[str]" = collections.Counter()
+        self._raise_on_analyzer_error = raise_on_analyzer_error
+        self._segment_overhead = segment_overhead_bytes
+        self._filter = self._build_filter(packet_filter, filter_expr)
+        self._current_name = "<unknown>"
         self._max_conversations = max_conversations
         self._max_conversation_bytes = max_conversation_bytes
         self._max_total_bytes = max_total_bytes
@@ -861,12 +1297,42 @@ class PcapStreamProcessor:
             for a in self.analyzers
         )
 
-    def _dispatch(self, method_name: str, *args) -> None:
+    @staticmethod
+    def _build_filter(
+        packet_filter: Optional[Callable[[int, FlowId], bool]], filter_expr: Optional[str]
+    ) -> Optional[_PacketPredicate]:
+        """Combine `filter_expr` and `packet_filter` into one internal predicate (or None)."""
+        predicates: List[_PacketPredicate] = []
+        if filter_expr is not None and filter_expr.strip():
+            predicates.append(compile_filter(filter_expr))
+        if packet_filter is not None:
+            user_filter = packet_filter
+
+            def call_user_filter(proto: int, src: bytes, sport: int, dst: bytes, dport: int) -> bool:
+                try:
+                    return bool(user_filter(proto, _make_flow_id(src, sport, dst, dport)))
+                except Exception as error:
+                    # Wrapped so that e.g. an OSError raised by a filter is not mistaken for a read error.
+                    raise AnalyzerError(f"packet_filter raised {error!r}") from error
+
+            predicates.append(call_user_filter)
+        if not predicates:
+            return None
+        if len(predicates) == 1:
+            return predicates[0]
+        first, second = predicates
+        return lambda proto, src, sport, dst, dport: (
+            first(proto, src, sport, dst, dport) and second(proto, src, sport, dst, dport)
+        )
+
+    def _dispatch(self, method_name: str, *args: Any) -> None:
         """Dispatch event callbacks to registered analyzers."""
         for analyzer in self.analyzers:
             try:
                 getattr(analyzer, method_name)(*args)
-            except Exception:
+            except Exception as error:
+                if self._raise_on_analyzer_error:
+                    raise AnalyzerError(f"Analyzer {analyzer!r} failed in {method_name}: {error}") from error
                 logger.exception("Analyzer %s failed in %s", analyzer, method_name)
 
     # -- Clock & Maintenance ------------------------------------------------
@@ -888,7 +1354,13 @@ class PcapStreamProcessor:
                 conversation = self._conversations.get(key)
                 if conversation is None:
                     self._closing.pop(key, None)
-                elif now - conversation.last_timestamp_ns > self._close_linger_ns:
+                elif (
+                    now - conversation.last_timestamp_ns > self._close_linger_ns
+                    and conversation.fully_closing()
+                ):
+                    # A half-close (only one side sent FIN) is NOT timed out here: the other
+                    # side may keep the connection open and respond much later. Such
+                    # conversations end by FIN/RST, `idle_timeout`, the size limits or flush.
                     self._evict_conversation(key, EVICT_FIN_TIMEOUT)
 
         if self._idle_timeout_ns is not None:
@@ -915,6 +1387,8 @@ class PcapStreamProcessor:
 
         self._closing.pop(key, None)
         self._total_bytes -= conversation.buffered
+        self.stats["tcp_conversations"] += 1
+        self.stats["evict_" + reason] += 1
         client_index = conversation.client_index if conversation.client_index is not None else 0
 
         streams: List[TCPStream] = []
@@ -934,6 +1408,7 @@ class PcapStreamProcessor:
                 gaps=gaps,
                 is_closed=reassembler.fin_seq is not None or reassembler.is_rst,
                 evict_reason=reason,
+                truncated_segments=reassembler.truncated_segments,
             )
             streams.append(TCPStream(flow_id, data, meta))
             reassembler.clear()
@@ -956,7 +1431,9 @@ class PcapStreamProcessor:
                 ),
             )
 
-    def _handle_tcp(self, timestamp_ns: int, src_raw: bytes, dst_raw: bytes, l4_data: bytes) -> None:
+    def _handle_tcp(
+        self, timestamp_ns: int, src_raw: bytes, dst_raw: bytes, l4_data: bytes, truncated: bool = False
+    ) -> None:
         """Ingest a single TCP segment, buffer payload, and evict stream if complete."""
         parsed_tcp = _parse_tcp(l4_data)
         if parsed_tcp is None:
@@ -978,11 +1455,18 @@ class PcapStreamProcessor:
             if is_initial_syn or timestamp_ns - closed_ns > self._close_linger_ns:
                 del self._recently_closed[key]
             else:
-                self.stats["late_packets"] += 1
+                if payload or flags & (TCP_SYN | TCP_FIN | TCP_RST):
+                    self.stats["late_packets"] += 1
+                else:
+                    # A bare ACK after close is normal (e.g. the final ACK of the FIN
+                    # exchange), so it is counted separately from real late data.
+                    self.stats["late_acks"] += 1
                 return
 
         conversation = self._conversations.get(key)
-        if conversation is not None and is_initial_syn and conversation.directions[index].has_data:
+        if conversation is not None and is_initial_syn and self._starts_new_connection(
+            conversation, index, seq
+        ):
             self._evict_conversation(key, EVICT_NEW_CONNECTION)
             conversation = None
 
@@ -998,7 +1482,9 @@ class PcapStreamProcessor:
             self._conversations.move_to_end(key)
 
         conversation.observe(index, flags, timestamp_ns)
-        added = conversation.directions[index].add(seq, payload, timestamp_ns, flags)
+        added = conversation.directions[index].add(seq, payload, timestamp_ns, flags, truncated)
+        if added:
+            added += self._segment_overhead  # Accounted size of a buffered segment
         conversation.buffered += added
         self._total_bytes += added
 
@@ -1022,6 +1508,22 @@ class PcapStreamProcessor:
         if self._max_total_bytes is not None:
             while self._total_bytes > self._max_total_bytes and self._conversations:
                 self._evict_conversation(next(iter(self._conversations)), EVICT_MAX_TOTAL_BYTES)
+
+    @staticmethod
+    def _starts_new_connection(conversation: _TCPConversation, index: int, seq: int) -> bool:
+        """Decide whether an initial SYN (no ACK) on a tracked 4-tuple begins a NEW connection.
+
+        - If this direction already sent a SYN, a different ISN means a new connection, while
+          the same ISN is just a SYN retransmission.
+        - Otherwise (no SYN seen from this side yet) it is a new connection only if data from
+          an earlier connection is already buffered, in either direction. Looking at both
+          directions matters for server-first protocols (SMTP, SSH, ...) where the SYN sender
+          has not sent anything yet.
+        """
+        syn_raw = conversation.directions[index].syn_raw
+        if syn_raw is not None:
+            return syn_raw != seq
+        return conversation.has_any_data()
 
     # -- UDP Processing ----------------------------------------------------
     def _handle_udp(self, timestamp_ns: int, src_raw: bytes, dst_raw: bytes, l4_data: bytes) -> None:
@@ -1057,7 +1559,9 @@ class PcapStreamProcessor:
             self.stats["bad_ip"] += 1
             return
 
-        src_raw, dst_raw, proto, l4_data, fragment = parsed_ip
+        src_raw, dst_raw, proto, l4_data, fragment, truncated = parsed_ip
+        if truncated:
+            self.stats["truncated_packets"] += 1
         if fragment is not None:
             self.stats["fragments"] += 1
             if not self._reassemble_fragments:
@@ -1066,16 +1570,24 @@ class PcapStreamProcessor:
             identification, fragment_offset, more_fragments = fragment
             assembled = self._fragments.add(
                 (src_raw, dst_raw, proto, identification),
-                fragment_offset, more_fragments, l4_data, timestamp_ns,
+                fragment_offset, more_fragments, l4_data, timestamp_ns, truncated,
             )
             if assembled is None:
                 return
             self.stats["frag_reassembled"] += 1
             l4_data = assembled
+            truncated = self._fragments.last_truncated
 
+        if proto != IPPROTO_TCP and proto != IPPROTO_UDP:
+            return
+        if self._filter is not None and len(l4_data) >= 4:
+            src_port, dst_port = struct.unpack_from("!HH", l4_data, 0)
+            if not self._filter(proto, src_raw, src_port, dst_raw, dst_port):
+                self.stats["filtered"] += 1
+                return
         if proto == IPPROTO_TCP:
-            self._handle_tcp(timestamp_ns, src_raw, dst_raw, l4_data)
-        elif proto == IPPROTO_UDP:
+            self._handle_tcp(timestamp_ns, src_raw, dst_raw, l4_data, truncated)
+        else:
             self._handle_udp(timestamp_ns, src_raw, dst_raw, l4_data)
 
     # -- I/O Engine -------------------------------------------------------
@@ -1092,21 +1604,23 @@ class PcapStreamProcessor:
             return None
         return bytes(buf)
 
-    @staticmethod
-    def _check_linktype(linktype: int) -> None:
+    def _check_linktype(self, linktype: int) -> None:
         if linktype not in _SUPPORTED_LINKTYPES:
-            logger.warning("Unsupported linktype %d: packets will be skipped", linktype)
+            logger.warning(
+                "%s: Unsupported linktype %d: packets will be skipped", self._current_name, linktype
+            )
 
     def _read_packets(self, stream: BinaryIO) -> None:
         """Stream PCAP records from file descriptor."""
+        name = self._current_name
         global_header = self._read_exact(stream, PCAP_GLOBAL_HEADER_LEN)
         if global_header is None:
-            logger.warning("Empty file")
+            logger.warning("%s: Empty file", name)
             return
 
         parsed = _parse_global_header(global_header)
         if parsed is None:
-            raise ValueError(f"Invalid pcap global header: {global_header[:4].hex()}")
+            raise PcapFormatError(_describe_bad_header(global_header))
 
         endian, linktype, is_nano = parsed
         self._check_linktype(linktype)
@@ -1120,14 +1634,14 @@ class PcapStreamProcessor:
 
             epoch_sec, subsec, incl_len, _orig_len = struct.unpack(endian + "IIII", packet_header)
             if incl_len > PCAP_MAX_INCL_LEN:
-                logger.warning("Unusually large incl_len %d, stopping", incl_len)
+                logger.warning("%s: Unusually large incl_len %d, stopping", name, incl_len)
                 break
             if incl_len == 0:
                 continue
 
             packet = self._read_exact(stream, incl_len)
             if packet is None or len(packet) < incl_len:
-                logger.warning("Truncated pcap (last packet incomplete)")
+                logger.warning("%s: Truncated pcap (last packet incomplete)", name)
                 break
 
             self._handle_packet(epoch_sec * NS_PER_SEC + subsec * ns_per_subsec, packet, linktype)
@@ -1157,33 +1671,76 @@ class PcapStreamProcessor:
         self._udp_flows.clear()
         self._dispatch("on_complete")
 
-    def process_file(self, pcap_path: str, flush_at_end: bool = True) -> None:
+    def process_stream(self, stream: BinaryIO, flush_at_end: bool = True, name: str = "<stream>") -> None:
+        """Process a classic PCAP read from an open binary file-like object. (Added in 0.1.0.)
+
+        Args:
+            stream: Binary stream positioned at the PCAP global header (e.g. `io.BytesIO`,
+                an already-open file, a decompressing reader such as `gzip.open(path, "rb")`).
+                The caller keeps ownership; it is not closed.
+            flush_at_end: Whether to flush active streams when reading ends.
+            name: Label used in log messages, error messages and `on_file_start/end`.
+
+        Raises:
+            PcapFormatError: If the data is not a classic PCAP.
+        """
+        self._refresh_analyzer_flags()
+        self._current_name = name
+        self._dispatch("on_file_start", name)
+        try:
+            try:
+                self._read_packets(stream)
+            except OSError as error:
+                self.stats["read_errors"] += 1
+                logger.warning("%s: Read error (%s): continuing with data read so far", name, error)
+            except PcapFormatError as error:
+                raise PcapFormatError(f"{name}: {error}") from error
+        finally:
+            self._dispatch("on_file_end", name)
+
+        if flush_at_end:
+            self.flush()
+
+    def process_file(self, pcap_path: "str | os.PathLike[str]", flush_at_end: bool = True) -> None:
         """Process a single PCAP file.
 
         Args:
             pcap_path: Path to raw classic PCAP file or named pipe.
             flush_at_end: Whether to flush active streams when file reading ends.
+
+        Raises:
+            FileNotFoundError: If the file does not exist.
+            PcapFormatError: If the file is not a classic PCAP (a `ValueError` subclass).
         """
-        if not os.path.exists(pcap_path):
-            raise FileNotFoundError(pcap_path)
-        logger.info("Processing %s", pcap_path)
-        self._refresh_analyzer_flags()
+        path = os.fspath(pcap_path)
+        if not os.path.exists(path):
+            raise FileNotFoundError(path)
+        logger.info("Processing %s", path)
+        with open(path, "rb") as stream:
+            self.process_stream(stream, flush_at_end=flush_at_end, name=path)
 
-        try:
-            with open(pcap_path, "rb") as stream:
-                try:
-                    self._read_packets(stream)
-                except OSError as error:
-                    self.stats["read_errors"] += 1
-                    logger.warning("Read error (%s): continuing with data read so far", error)
-        except ValueError as error:
-            raise ValueError(f"{pcap_path}: {error}") from error
+    def process_files(self, pcap_paths: Iterable["str | os.PathLike[str]"], on_error: str = "raise") -> None:
+        """Process a sequence of PCAP files in chronological order, holding conversation state across boundaries.
 
-        if flush_at_end:
-            self.flush()
-
-    def process_files(self, pcap_paths: Iterable[str]) -> None:
-        """Process a sequence of PCAP files in chronological order, holding conversation state across boundaries."""
+        Args:
+            pcap_paths: Files in chronological order.
+            on_error: `"raise"` (default, the 0.0.x behaviour) stops at the first unreadable
+                file and raises; streams buffered so far stay buffered (call `flush()` if
+                you want them delivered). `"skip"` logs a warning, counts the file in
+                `stats["failed_files"]`, continues with the remaining files and still flushes
+                at the end.
+        """
+        if on_error not in ("raise", "skip"):
+            raise ValueError('on_error must be "raise" or "skip"')
         paths = list(pcap_paths)
         for index, path in enumerate(paths):
-            self.process_file(path, flush_at_end=(index == len(paths) - 1))
+            is_last = index == len(paths) - 1
+            try:
+                self.process_file(path, flush_at_end=is_last)
+            except (PcapFormatError, OSError) as error:
+                if on_error == "raise":
+                    raise
+                self.stats["failed_files"] += 1
+                logger.warning("Skipping %s: %s", os.fspath(path), error)
+                if is_last:
+                    self.flush()
