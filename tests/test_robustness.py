@@ -320,6 +320,20 @@ class TestErrorsAndInputs(PcapTestCase):
             P.PcapStreamProcessor().process_stream(io.BytesIO(b"x" * 40), name="mem")
         self.assertIn("mem", str(ctx.exception))
 
+    def test_gzip_compressed_capture_via_process_stream(self):
+        import gzip
+
+        path = os.path.join(self.tmpdir, "capture.pcap.gz") if hasattr(self, "tmpdir") else None
+        if path is None:
+            import tempfile
+            path = os.path.join(tempfile.mkdtemp(), "capture.pcap.gz")
+        with gzip.open(path, "wb") as handle:
+            handle.write(make_pcap(http_like_session()))
+        rec = Recorder()
+        with gzip.open(path, "rb") as handle:
+            P.PcapStreamProcessor(analyzers=[rec]).process_stream(handle, name=path)
+        self.assertEqual(rec.convs[0].server.data, b"HELLO WORLD")
+
     def test_process_file_accepts_pathlib_path(self):
         rec = Recorder()
         path = pathlib.Path(self.write_pcap(make_pcap(http_like_session())))
@@ -498,7 +512,8 @@ class TestMutationFuzz(unittest.TestCase):
                 data[rnd.randrange(24, len(data))] = rnd.randrange(256)
             if rnd.random() < 0.3:
                 del data[rnd.randrange(24, len(data)):]
-            P.PcapStreamProcessor(analyzers=[Recorder()], filter_expr="tcp or udp").process_stream(io.BytesIO(bytes(data)))
+            processor = P.PcapStreamProcessor(analyzers=[Recorder()], filter_expr="tcp or udp")
+            processor.process_stream(io.BytesIO(bytes(data)))
 
 
 if __name__ == "__main__":

@@ -16,7 +16,7 @@ import unittest
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), os.pardir))
 import pcapreasm as P  # noqa: E402
 from test_pcapreasm import (  # noqa: E402
-    ACK, C, FIN, PSH, S, SYN, PcapTestCase, Recorder,
+    ACK, C, FIN, PSH, S, SYN, PcapTestCase,
     http_like_session, ip4, ip6, make_pcap, ms, tcp_pkt, udp, udp_pkt,
 )
 

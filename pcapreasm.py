@@ -249,9 +249,11 @@ class PcapFormatError(ValueError):
 
 
 class AnalyzerError(Exception):
-    """Raised (only when `raise_on_analyzer_error=True`) if an analyzer callback fails.
+    """Raised when user code called by the processor fails and the failure must not be hidden.
 
-    The original exception is available as `__cause__`.
+    Raised if an analyzer callback fails and `raise_on_analyzer_error=True` was given, and
+    always if a `packet_filter` callable fails (a broken filter would otherwise silently
+    drop or keep packets). The original exception is available as `__cause__`.
     """
 
 
@@ -261,7 +263,7 @@ class FilterSyntaxError(ValueError):
 
 def ns_to_seconds(timestamp_ns: int) -> float:
     """Convert integer nanoseconds to epoch seconds as float.
-    
+
     Note: Using floats causes precision loss; use primarily for display or rough metrics.
     """
     return timestamp_ns / NS_PER_SEC
@@ -549,7 +551,10 @@ def _describe_bad_header(global_header: bytes) -> str:
             "save it as classic pcap or convert it: editcap -F pcap in.pcapng out.pcap)"
         )
     if magic[:2] == b"\x1f\x8b":
-        return message + " (this looks like a gzip-compressed file; decompress it first, or pass gzip.open(path, 'rb') to process_stream)"
+        return (
+            message + " (this looks like a gzip-compressed file; decompress it first, "
+            "or pass gzip.open(path, 'rb') to process_stream)"
+        )
     if len(global_header) < PCAP_GLOBAL_HEADER_LEN:
         return message + f" (file too short: {len(global_header)} bytes)"
     if len(magic) == 4 and struct.unpack_from("<I", magic)[0] in _MAGIC_TABLE:
@@ -1134,7 +1139,9 @@ class _FilterParser:
             literal = self._literal(ptype)
         else:
             bad = self.tokens[self.pos] if self.pos < len(self.tokens) else "end of expression"
-            raise FilterSyntaxError(f"unsupported or unexpected {bad!r} in filter expression ({_FILTER_SUPPORTED_HELP})")
+            raise FilterSyntaxError(
+                f"unsupported or unexpected {bad!r} in filter expression ({_FILTER_SUPPORTED_HELP})"
+            )
 
         self.last_qualifiers = (proto, direction, ptype)
         return _filter_primitive(proto, direction, ptype, literal)
