@@ -3,6 +3,22 @@
 形式は [Keep a Changelog](https://keepachangelog.com/ja/1.1.0/) に準拠し、バージョンは [セマンティック バージョニング](https://semver.org/lang/ja/) に従います。
 0.1.x では **公開 API の後方互換を維持**します。バグ修正によって同じ入力に対する出力が変わる場合は、下記の「挙動の変更」に明記します。
 
+## [0.2.0] - 2026-11-16
+
+後方互換を保つ 0.1.x から、動作環境と既定値を変える版です。ライブラリの API(関数・クラス・引数)は 0.1.0 と互換です。
+
+### 変更(0.1.0 からの互換性に影響するもの)
+- **最低 Python バージョンを 3.7 から 3.9 に引き上げ**。CI は 3.9〜3.13。
+- **`segment_overhead_bytes` の既定を `0` から `150` に変更**。`max_conversation_bytes` / `max_total_bytes` を指定している場合、同じ値でも、1 セグメントあたり 150 バイトが加算されるため、上限に早く達し、古い会話が早く確定される(`evict_reason` が `max_bytes` / `max_total_bytes` になる件数が増える)。上限を指定していなければ影響はない。従来の数え方に戻すには `segment_overhead_bytes=0` を指定する。
+  150 は実測値(1 セグメントあたりの実メモリ増加はペイロード別に 110〜220 バイト)から決めた。
+
+### 追加
+- **コマンドライン** `python -m pcapreasm`(`pip install` した環境では `pcapreasm` コマンドも): 1 つの TCP 会話(`--udp` で UDP フローも)ごとに 1 行を、テキストまたは JSON Lines で出力する。`-f/--filter`、`-l/--file-list`、`--on-error`、`--idle-timeout`、`--max-memory-mb` などに対応。標準入力(`-`)も読める。終了コードは 0(正常)、1(実行時エラー)、2(引数・フィルタ式の誤り)。
+- `pcapreasm.main(argv)`(コマンドラインの入口)。
+
+### 対応しないこと
+- pcapng。クラシック PCAP のみ対応で、pcapng を渡すと、変換方法(`editcap -F pcap` など)を示すエラーになる。
+
 ## [0.1.0] - 2026-11-16
 
 ### 追加
@@ -34,12 +50,6 @@
 - 上記の修正により、該当する入力に限り、同じ pcap でも出力が変わる(conversation の数、`evict_reason`、`client_certain`、`stats["late_packets"]`)。
 - 半クローズで相手が応答しないまま終わる接続は、`fin_timeout` ではなく、アイドル・上限・flush(`EVICT_FLUSH` など)で確定する。
 - `packet_filter` が例外を送出したときは、フィルタの誤動作で通信が黙って落ちるのを避けるため、`raise_on_analyzer_error` の値によらず `AnalyzerError` を送出する。
-
-### 0.2.x へ先送りした項目
-- pcapng の本格対応。
-- 最低 Python バージョンを 3.9 に引き上げる(0.1.x は 3.7 以上を維持)。
-- `segment_overhead_bytes` を既定で有効にする。
-- コマンドライン(`python -m pcapreasm`)。
 
 ## [0.0.1]
 - 初版。

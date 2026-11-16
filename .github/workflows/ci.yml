@@ -11,12 +11,11 @@ permissions:
 jobs:
   test:
     name: Tests (Python ${{ matrix.python-version }})
-    # ubuntu-22.04 is used because it still provides Python 3.7, the minimum supported version.
-    runs-on: ubuntu-22.04
+    runs-on: ubuntu-latest
     strategy:
       fail-fast: false
       matrix:
-        python-version: ["3.7", "3.8", "3.9", "3.10", "3.11", "3.12", "3.13"]
+        python-version: ["3.9", "3.10", "3.11", "3.12", "3.13"]
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
