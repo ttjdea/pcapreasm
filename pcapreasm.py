@@ -108,6 +108,7 @@ import os
 import re
 import socket
 import struct
+import zlib
 from dataclasses import dataclass
 from typing import Any, BinaryIO, Callable, Dict, Iterable, List, Optional, Tuple
 
@@ -949,6 +950,8 @@ _FILTER_OR = ("or", "||")
 _FILTER_NOT = ("not", "!")
 _FILTER_PROTOS = ("tcp", "udp", "ip", "ip6")
 _FILTER_TYPES = ("host", "net", "port", "portrange")
+_FILTER_MAX_DEPTH = 100  # Max nesting of parentheses / 'not' (deeper would risk RecursionError)
+_FILTER_PORT_RE = re.compile(r"[0-9]{1,5}")  # ASCII digits only (int() would also accept "1_0", "+80", ...)
 _FILTER_SUPPORTED_HELP = (
     "supported: tcp, udp, ip, ip6, [src|dst|src or dst|src and dst] host/net/port/portrange, "
     "and, or, not, parentheses"
@@ -1005,10 +1008,14 @@ def _filter_primitive(proto: Optional[str], direction: Optional[str], ptype: str
     else:
         try:
             if ptype == "port":
+                if not _FILTER_PORT_RE.fullmatch(literal):
+                    raise ValueError("expected digits")
                 low = high = int(literal)
             else:
                 low_text, separator, high_text = literal.partition("-")
-                if not separator:
+                if not (
+                    separator and _FILTER_PORT_RE.fullmatch(low_text) and _FILTER_PORT_RE.fullmatch(high_text)
+                ):
                     raise ValueError("expected LOW-HIGH")
                 low, high = int(low_text), int(high_text)
         except ValueError:
@@ -1038,6 +1045,7 @@ class _FilterParser:
             if match.group(1) is not None:
                 self.tokens.append(match.group(1))
         self.pos = 0
+        self.depth = 0  # Current nesting of parentheses / 'not' (bounded by _FILTER_MAX_DEPTH)
         # Qualifiers of the previous primitive, so "port 80 or 443" means "port 80 or port 443"
         self.last_qualifiers: Optional[Tuple[Optional[str], Optional[str], str]] = None
 
@@ -1054,7 +1062,10 @@ class _FilterParser:
         return self.tokens[index].lower() if index < len(self.tokens) else None
 
     def _expression(self) -> _PacketPredicate:
-        left = self._unary()
+        # A chain "a or b or c ..." is collected into one list and evaluated in a loop. Building
+        # nested closures instead would recurse once per term and hit Python's recursion limit
+        # on long (e.g. block-list sized) expressions.
+        terms = [self._unary()]
         operator: Optional[str] = None
         while True:
             token = self._peek()
@@ -1063,7 +1074,7 @@ class _FilterParser:
             elif token in _FILTER_OR:
                 current = "or"
             else:
-                return left
+                break
             if operator is not None and operator != current:
                 raise FilterSyntaxError(
                     "mixing 'and' and 'or' without parentheses is ambiguous (tcpdump treats them as "
@@ -1071,27 +1082,53 @@ class _FilterParser:
                 )
             operator = current
             self.pos += 1
-            right = self._unary()
-            left = self._combine(operator, left, right)
+            terms.append(self._unary())
+        return self._combine(operator, terms)
 
     @staticmethod
-    def _combine(operator: str, left: _PacketPredicate, right: _PacketPredicate) -> _PacketPredicate:
+    def _combine(operator: Optional[str], terms: List[_PacketPredicate]) -> _PacketPredicate:
+        if operator is None:
+            return terms[0]
+        funcs = tuple(terms)
         if operator == "and":
-            return lambda p, s, sp, d, dp: left(p, s, sp, d, dp) and right(p, s, sp, d, dp)
-        return lambda p, s, sp, d, dp: left(p, s, sp, d, dp) or right(p, s, sp, d, dp)
+            def all_of(p: int, s: bytes, sp: int, d: bytes, dp: int) -> bool:
+                for func in funcs:
+                    if not func(p, s, sp, d, dp):
+                        return False
+                return True
+            return all_of
+
+        def any_of(p: int, s: bytes, sp: int, d: bytes, dp: int) -> bool:
+            for func in funcs:
+                if func(p, s, sp, d, dp):
+                    return True
+            return False
+        return any_of
+
+    def _enter(self) -> None:
+        self.depth += 1
+        if self.depth > _FILTER_MAX_DEPTH:
+            raise FilterSyntaxError(
+                f"filter expression is nested too deeply (more than {_FILTER_MAX_DEPTH} levels of "
+                "parentheses / 'not')"
+            )
 
     def _unary(self) -> _PacketPredicate:
         token = self._peek()
         if token in _FILTER_NOT:
             self.pos += 1
+            self._enter()
             inner = self._unary()
+            self.depth -= 1
             return lambda p, s, sp, d, dp: not inner(p, s, sp, d, dp)
         if token == "(":
             self.pos += 1
+            self._enter()
             node = self._expression()
             if self._peek() != ")":
                 raise FilterSyntaxError("missing closing parenthesis in filter expression")
             self.pos += 1
+            self.depth -= 1
             return node
         return self._primitive()
 
@@ -1520,16 +1557,21 @@ class PcapStreamProcessor:
     def _starts_new_connection(conversation: _TCPConversation, index: int, seq: int) -> bool:
         """Decide whether an initial SYN (no ACK) on a tracked 4-tuple begins a NEW connection.
 
-        - If this direction already sent a SYN, a different ISN means a new connection, while
-          the same ISN is just a SYN retransmission.
+        - If this direction already sent a SYN, a different ISN means a new connection. The
+          same ISN is a SYN retransmission, unless this direction has already sent data: a
+          retransmitted SYN cannot follow data, so that is a new connection that happens to
+          reuse the ISN (constant-ISN stacks, replay tools). This is what 0.0.1 did.
         - Otherwise (no SYN seen from this side yet) it is a new connection only if data from
           an earlier connection is already buffered, in either direction. Looking at both
           directions matters for server-first protocols (SMTP, SSH, ...) where the SYN sender
           has not sent anything yet.
+
+        Known limit: a new connection that reuses the client's ISN *and* only ever had
+        server-first data is indistinguishable from a late duplicate SYN and is treated as one.
         """
-        syn_raw = conversation.directions[index].syn_raw
-        if syn_raw is not None:
-            return syn_raw != seq
+        direction = conversation.directions[index]
+        if direction.syn_raw is not None:
+            return direction.syn_raw != seq or direction.has_data
         return conversation.has_any_data()
 
     # -- UDP Processing ----------------------------------------------------
@@ -1697,7 +1739,8 @@ class PcapStreamProcessor:
         try:
             try:
                 self._read_packets(stream)
-            except OSError as error:
+            except (OSError, EOFError, zlib.error) as error:
+                # EOFError / zlib.error: a truncated or corrupt gzip/zlib stream passed in by the caller
                 self.stats["read_errors"] += 1
                 logger.warning("%s: Read error (%s): continuing with data read so far", name, error)
             except PcapFormatError as error:

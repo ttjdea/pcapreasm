@@ -5,6 +5,7 @@ tcpdump が入っている環境では、tcpdump 自身の判定と突き合わ�
 (入っていなければ自動でスキップされます)。
 """
 
+import io
 import os
 import random
 import shutil
@@ -16,7 +17,7 @@ import unittest
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), os.pardir))
 import pcapreasm as P  # noqa: E402
 from test_pcapreasm import (  # noqa: E402
-    ACK, C, FIN, PSH, S, SYN, PcapTestCase,
+    ACK, C, FIN, PSH, Recorder, S, SYN, PcapTestCase,
     http_like_session, ip4, ip6, make_pcap, ms, tcp_pkt, udp, udp_pkt,
 )
 
@@ -158,6 +159,42 @@ class TestCompileFilter(unittest.TestCase):
     def test_filter_syntax_error_is_a_value_error(self):
         with self.assertRaises(ValueError):
             P.compile_filter("vlan")
+
+    def test_very_long_chains_do_not_hit_the_recursion_limit(self):
+        """ブロックリスト級の長い or / and 連鎖(レビューで RecursionError になった)。"""
+        count = 5000
+        hosts = [f"10.{(i >> 8) & 255}.{i & 255}.1" for i in range(count)]
+        either = "host " + " or ".join(hosts)  # "host a or b or c ..." (修飾子の省略)
+        neither = " and ".join(f"not host {h}" for h in hosts)
+        self.assertTrue(check(either, TCP, hosts[-1], 1, "192.0.2.1", 2))
+        self.assertFalse(check(either, TCP, "192.0.2.1", 1, "192.0.2.2", 2))
+        self.assertFalse(check(neither, TCP, hosts[0], 1, "192.0.2.1", 2))
+        self.assertTrue(check(neither, TCP, "192.0.2.1", 1, "192.0.2.2", 2))
+
+    def test_long_chain_works_through_the_processor(self):
+        hosts = [f"10.{(i >> 8) & 255}.{i & 255}.1" for i in range(3000)]
+        expression = "host " + " or ".join(hosts) + " or 10.0.0.1"
+        proc = P.PcapStreamProcessor(analyzers=[Recorder()], filter_expr=expression)
+        proc.process_stream(io.BytesIO(make_pcap(http_like_session())))
+        self.assertEqual(proc.stats["tcp_conversations"], 1)
+
+    def test_excessive_nesting_is_a_syntax_error_not_a_recursion_error(self):
+        for expression in ("(" * 1000 + "tcp" + ")" * 1000, "not " * 1000 + "tcp", "!" * 500 + "tcp"):
+            with self.subTest(expression=expression[:20]):
+                with self.assertRaises(P.FilterSyntaxError):
+                    P.compile_filter(expression)
+
+    def test_reasonable_nesting_still_works(self):
+        self.assertTrue(check("(" * 50 + "tcp" + ")" * 50, TCP, "10.0.0.1", 1, "10.0.0.2", 2))
+        self.assertTrue(check("not " * 20 + "tcp", TCP, "10.0.0.1", 1, "10.0.0.2", 2))
+
+    def test_port_numbers_must_be_plain_ascii_digits(self):
+        for expression in ("port 1_0", "port +80", "port -80", "port ٨٠", "port 0x50", "portrange 1_0-20",
+                           "portrange +1-20", "portrange 1-٢٠", "port 080000"):
+            with self.subTest(expression=expression):
+                with self.assertRaises(P.FilterSyntaxError):
+                    P.compile_filter(expression)
+        self.assertTrue(check("port 080", TCP, "10.0.0.1", 80, "10.0.0.2", 1))  # 先頭の 0 は許す(tcpdump も 10 進)
 
     def test_same_operator_can_chain(self):
         self.assertTrue(check("port 1 or port 2 or port 80", TCP, self.A, 80, self.B, 9))

@@ -236,6 +236,39 @@ class TestNewConnectionDetection(PcapTestCase):
         self.assertEqual(len(rec.convs), 1)
         self.assertEqual(rec.convs[0].server.data, b"220 hello\r\n")
 
+    @staticmethod
+    def _client_first_session(t0, client_isn, server_isn, request, response):
+        return [
+            tcp_pkt(t0, C, 1234, S, 80, client_isn, 0, SYN),
+            tcp_pkt(t0 + 1, S, 80, C, 1234, server_isn, client_isn + 1, SYN | ACK),
+            tcp_pkt(t0 + 2, C, 1234, S, 80, client_isn + 1, server_isn + 1, PSH | ACK, request),
+            tcp_pkt(t0 + 3, S, 80, C, 1234, server_isn + 1, client_isn + 1 + len(request), PSH | ACK, response),
+        ]
+
+    def test_reused_four_tuple_with_the_same_isn_is_still_split(self):
+        """ISN を変えない実装(組込み機器・リプレイツール)でも、データのあと SYN が来たら別接続。
+
+        0.0.1 は分けていた。これを同じ ISN の SYN 再送とみなして 1 本にまとめると、
+        2 本目の通信が再送として黙って捨てられる(レビューで見つかった退行)。
+        """
+        pkts = (
+            self._client_first_session(0, 1000, 6000, b"REQ1", b"RESP1")
+            + self._client_first_session(10_000, 1000, 6000, b"REQ2", b"RESP2")
+        )
+        rec, _ = self.run_pcap(make_pcap(pkts))
+        self.assertEqual([c.client.data for c in rec.convs], [b"REQ1", b"REQ2"])
+        self.assertEqual([c.server.data for c in rec.convs], [b"RESP1", b"RESP2"])
+        self.assertEqual(rec.convs[0].evict_reason, P.EVICT_NEW_CONNECTION)
+
+    def test_reused_four_tuple_with_same_client_isn_but_new_server_isn(self):
+        pkts = (
+            self._client_first_session(0, 1000, 6000, b"REQ1", b"RESP1")
+            + self._client_first_session(10_000, 1000, 9000, b"REQ2", b"RESP2")
+        )
+        rec, _ = self.run_pcap(make_pcap(pkts))
+        self.assertEqual([c.client.data for c in rec.convs], [b"REQ1", b"REQ2"])
+        self.assertEqual([c.server.data for c in rec.convs], [b"RESP1", b"RESP2"])
+
     def test_new_syn_after_handshake_only_connection(self):
         pkts = [
             tcp_pkt(0, C, 40000, S, 25, 1000, 0, SYN),
@@ -333,6 +366,37 @@ class TestErrorsAndInputs(PcapTestCase):
         with gzip.open(path, "rb") as handle:
             P.PcapStreamProcessor(analyzers=[rec]).process_stream(handle, name=path)
         self.assertEqual(rec.convs[0].server.data, b"HELLO WORLD")
+
+    def _gzip_bytes(self):
+        import gzip
+
+        buffer = io.BytesIO()
+        with gzip.GzipFile(fileobj=buffer, mode="wb") as handle:
+            handle.write(make_pcap(http_like_session() * 40))
+        return buffer.getvalue()
+
+    def test_truncated_gzip_is_handled_like_a_truncated_pcap(self):
+        """gzip が途中で切れていても例外を漏らさず、読めた分を処理して警告する。"""
+        import gzip
+
+        raw = self._gzip_bytes()
+        rec = Recorder()
+        proc = P.PcapStreamProcessor(analyzers=[rec])
+        with self.assertLogs("pcapreasm", level="WARNING") as logs:
+            proc.process_stream(gzip.GzipFile(fileobj=io.BytesIO(raw[: len(raw) // 2])), name="cut.gz")
+        self.assertTrue(any("cut.gz" in line and "Read error" in line for line in logs.output), logs.output)
+        self.assertEqual(proc.stats["read_errors"], 1)
+        self.assertEqual(rec.completed, 1)  # flush まで行われる
+
+    def test_corrupt_gzip_is_handled_like_a_truncated_pcap(self):
+        import gzip
+
+        raw = bytearray(self._gzip_bytes())
+        raw[-6] ^= 0xFF  # CRC32 in the trailer: detected only when the stream is read to its end
+        proc = P.PcapStreamProcessor(analyzers=[Recorder()])
+        with self.assertLogs("pcapreasm", level="WARNING"):
+            proc.process_stream(gzip.GzipFile(fileobj=io.BytesIO(bytes(raw))), name="bad.gz")
+        self.assertEqual(proc.stats["read_errors"], 1)
 
     def test_process_file_accepts_pathlib_path(self):
         rec = Recorder()

@@ -448,7 +448,7 @@ PcapStreamProcessor(filter_expr="tcp and port 80")
 | `src` / `dst` | `src host ...` `dst port ...` のように方向を限定 |
 | `src or dst` / `src and dst` | `src and dst port 80` は送信元と宛先の両方が 80 |
 | `and` `or` `not`(`&&` `\|\|` `!`) | 論理演算 |
-| `( ... )` | 括弧 |
+| `( ... )` | 括弧(`not` と合わせて入れ子は 100 段まで。ポート番号は半角数字のみ) |
 | プロトコルの前置 | `tcp port 80`、`udp dst port 53`、`ip6 and host 2001:db8::1` |
 | 修飾子の省略 | tcpdump と同じく、`port 80 or 443` は `port 80 or port 443` |
 

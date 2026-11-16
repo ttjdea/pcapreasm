@@ -177,6 +177,7 @@ Deliberate differences from tcpdump:
 
 - Host names and service names (`http`) are **not resolved**; use IP literals and port numbers.
 - Mixing `and` with `or` without parentheses is an **error** (tcpdump evaluates left to right, which is easy to misread).
+- Nesting of parentheses / `not` is limited to 100 levels; port numbers must be ASCII digits.
 - Unsupported syntax (`ether`, `vlan`, byte offsets such as `tcp[13]`, `less` / `greater`, `icmp`, ...) raises `FilterSyntaxError` instead of being ignored, so a typo can never silently let everything through.
 - IP fragments are filtered **after reassembly**, because later fragments carry no port number (tcpdump's `port` never matches them).
 - `tests/test_filter.py` compares the match counts with tcpdump 4.99.4 (when tcpdump is installed) for 21 expressions over 400 random packets; they agree.
