@@ -9,10 +9,12 @@
 pytest がある場合:
     pytest tests -v
 
-TestKnownIssues は「現在わかっている問題」を記録するテストです。
-問題が未修正の間は expectedFailure(期待どおりの失敗)として扱われ、
-修正されると「unexpected success」になって知らせてくれます。
+TestKnownIssues は 0.0.1 で既知だった問題の回帰テストです(0.1.0 で修正済み)。
+新たに見つかった問題は @unittest.expectedFailure を付けて追加すると、
+修正されたときに「unexpected success」で知らせてくれます。
 その場合は @unittest.expectedFailure を外してください。
+
+0.1.0 で追加した機能のテストは test_robustness.py と test_filter.py にあります。
 """
 
 import os
@@ -520,16 +522,15 @@ class TestAnalyzerAndLimits(PcapTestCase):
 
 
 # ---------------------------------------------------------------------------
-# 現在わかっている問題(修正されるまでは expectedFailure)
+# 0.0.1 で既知だった問題(0.1.0 で修正済み。回帰防止のため残す)
 # ---------------------------------------------------------------------------
 class TestKnownIssues(PcapTestCase):
-    @unittest.expectedFailure
     def test_half_close_longer_than_close_linger_keeps_one_conversation(self):
         """クライアントが FIN 後、サーバが close_linger(5 秒)超えて応答しても、
         1 つの会話としてクライアント/サーバの役割が保たれるべき。
 
-        現状: fin_timeout で一度確定され、遅れて届いたサーバのデータが別会話になり、
-        client_certain=False で役割が逆に割り当てられる。
+        0.0.1 の挙動: fin_timeout で一度確定され、遅れて届いたサーバのデータが別会話になり、
+        client_certain=False で役割が逆に割り当てられた(0.1.0 で修正)。
         """
         pkts = [
             tcp_pkt(0, C, 1234, S, 80, 1000, 0, SYN),
@@ -544,13 +545,11 @@ class TestKnownIssues(PcapTestCase):
         self.assertEqual(rec.convs[0].server.data, b"LATE-RESPONSE")
         self.assertEqual(rec.convs[0].server.flow_id, (S, 80, C, 1234))
 
-    @unittest.expectedFailure
     def test_normal_close_does_not_count_late_packets(self):
         """正常終了(最後の ACK)が late_packets に数えられないべき。"""
         _, proc = self.run_pcap(make_pcap(http_like_session()))
         self.assertEqual(proc.stats["late_packets"], 0)
 
-    @unittest.expectedFailure
     def test_pcapng_error_message_mentions_pcapng(self):
         """pcapng を渡したとき、エラーメッセージで pcapng 非対応だと分かるべき。"""
         with self.assertRaises(ValueError) as ctx:

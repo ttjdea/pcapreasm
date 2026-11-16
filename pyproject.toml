@@ -1,0 +1,50 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "pcapreasm"
+dynamic = ["version"]
+description = "Extract TCP/UDP application-layer streams from classic PCAP files (single file, standard library only)"
+readme = "README.md"
+requires-python = ">=3.7"
+license = { text = "MPL-2.0" }
+authors = [{ name = "ttjdea" }]
+keywords = ["pcap", "tcp", "udp", "reassembly", "network", "forensics"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: Mozilla Public License 2.0 (MPL 2.0)",
+    "Programming Language :: Python :: 3",
+    "Topic :: System :: Networking :: Monitoring",
+    "Topic :: Software Development :: Libraries :: Python Modules",
+]
+
+[project.urls]
+Homepage = "https://github.com/ttjdea/pcapreasm"
+Issues = "https://github.com/ttjdea/pcapreasm/issues"
+Changelog = "https://github.com/ttjdea/pcapreasm/blob/main/CHANGELOG.md"
+
+[tool.setuptools]
+py-modules = ["pcapreasm"]
+
+[tool.setuptools.dynamic]
+version = { attr = "pcapreasm.__version__" }
+
+# Python 3.7 is still supported in 0.1.x, so syntax that needs a newer Python
+# (e.g. `X | None` annotations, which ruff's "UP" rules would force) must not be introduced.
+[tool.ruff]
+line-length = 120
+target-version = "py37"
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "B"]
+ignore = [
+    "E731",  # short lambdas used as predicates in the filter compiler
+    "B024",  # BaseAnalyzer is abstract on purpose, yet every callback is optional...
+    "B027",  # ...so its empty methods are intentionally not @abstractmethod
+]
+
+[tool.mypy]
+strict = true
+files = ["pcapreasm.py"]
