@@ -3,7 +3,7 @@
 形式は [Keep a Changelog](https://keepachangelog.com/ja/1.1.0/) に準拠し、バージョンは [セマンティック バージョニング](https://semver.org/lang/ja/) に従います。
 0.1.x では **公開 API の後方互換を維持**します。バグ修正によって同じ入力に対する出力が変わる場合は、下記の「挙動の変更」に明記します。
 
-## [0.1.0] - 未リリース
+## [0.1.0] - 2026-11-16
 
 ### 追加
 - **パケットフィルタ**: `PcapStreamProcessor(filter_expr="tcp and port 80")` と `packet_filter=callable`。tcpdump 式の部分集合(`tcp` `udp` `ip` `ip6`、`[src|dst] host/net/port/portrange`、`and` `or` `not`、括弧)に対応。`compile_filter()` と `FilterSyntaxError` も公開。除外したパケットは TCP/UDP の状態を一切作らず、`stats["filtered"]` に数えられる。
