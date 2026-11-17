@@ -141,14 +141,49 @@ class TestInputsAndErrors(CliTestCase):
         code, _, err = self.run_main(bad, good)
         self.assertEqual(code, 1)
         self.assertIn("Error:", err)
-        code, out, _ = self.run_main(bad, good, "--on-error", "skip")
-        self.assertEqual(code, 0)
+        code, out, err = self.run_main(bad, good, "--on-error", "skip")
+        self.assertEqual(code, 1)  # the good file is processed, but the exit code reports the skipped one
         self.assertEqual(len(out.splitlines()), 1)
+        self.assertIn("1 file(s) could not be read", err)
 
     def test_version(self):
         code, out, _ = self.run_main("--version")
         self.assertEqual(code, 0)
         self.assertEqual(out.strip(), "pcapreasm " + P.__version__)
+
+    def test_main_returns_instead_of_exiting(self):
+        for argv in (["--version"], ["--help"], [], ["x.pcap", "--format", "bogus"]):
+            with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+                code = P.main(argv)
+            self.assertIsInstance(code, int)
+        self.assertEqual(self.run_main("--version")[0], 0)
+        self.assertEqual(self.run_main("--format", "bogus", "x")[0], 2)
+
+    def test_non_finite_idle_timeout_is_a_usage_error(self):
+        path = self.write("a.pcap", make_pcap(http_like_session()))
+        for value in ("nan", "inf", "-inf"):
+            code, _, err = self.run_main(path, "--idle-timeout", value)
+            self.assertEqual(code, 2, value)
+            self.assertNotIn("Traceback", err)
+
+    def test_stdin_cannot_be_mixed_with_files(self):
+        path = self.write("a.pcap", make_pcap(http_like_session()))
+        for argv in ([path, "-"], ["-", "-"]):
+            code, _, err = self.run_main(*argv)
+            self.assertEqual(code, 2)
+            self.assertIn("cannot be combined", err)
+
+    def test_file_list_tolerates_a_utf8_bom(self):
+        path = self.write("a.pcap", make_pcap(http_like_session()))
+        lst = self.write("list.txt", b"\xef\xbb\xbf" + path.encode() + b"\n")
+        code, out, _ = self.run_main("-l", lst)
+        self.assertEqual(code, 0)
+        self.assertEqual(len(out.splitlines()), 1)
+
+    def test_all_files_skipped_is_not_success(self):
+        bad = self.write("bad.pcap", b"not a pcap")
+        code, out, _ = self.run_main(bad, "--on-error", "skip")
+        self.assertEqual((code, out), (1, ""))
 
     def test_negative_limits_are_rejected(self):
         path = self.write("a.pcap", make_pcap(http_like_session()))
@@ -173,6 +208,29 @@ class TestAsModule(CliTestCase):
         result = self.run_module("-", stdin=make_pcap(http_like_session()))
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn(b" TCP ", result.stdout)
+
+    @unittest.skipUnless(os.path.exists("/dev/full"), "needs /dev/full")
+    def test_full_disk_on_stdout_is_one_clean_error(self):
+        path = self.write("many.pcap", make_pcap(sum((session_at(i) for i in range(300)), [])))
+        env = dict(os.environ, PYTHONPATH=os.path.abspath(ROOT))
+        with open("/dev/full", "wb") as full:
+            result = subprocess.run(
+                [sys.executable, "-m", "pcapreasm", path], stdout=full, stderr=subprocess.PIPE, env=env, timeout=60
+            )
+        self.assertEqual(result.returncode, 1, result.stderr)
+        self.assertEqual(result.stderr.count(b"Error:"), 1, result.stderr)
+        self.assertNotIn(b"Traceback", result.stderr)
+        self.assertNotIn(b"Exception ignored", result.stderr)
+
+    def test_closed_stdout_is_one_clean_error(self):
+        path = self.write("a.pcap", make_pcap(http_like_session()))
+        env = dict(os.environ, PYTHONPATH=os.path.abspath(ROOT))
+        result = subprocess.run(
+            [sys.executable, "-c", "import os, sys; os.close(1); sys.argv = ['pcapreasm', %r]; "
+             "import pcapreasm; sys.exit(pcapreasm._script_main())" % path],
+            stderr=subprocess.PIPE, env=env, timeout=60, stdout=subprocess.DEVNULL,
+        )
+        self.assertNotIn(b"Traceback", result.stderr)
 
     def test_closed_pipe_is_quiet(self):
         pkts = []

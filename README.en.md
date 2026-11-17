@@ -3,7 +3,7 @@
 A **standard-library-only** Python module that extracts TCP / UDP application-layer data from PCAP captures. It is a single file, `pcapreasm.py`, with no dependencies.
 
 - License: MPL-2.0
-- Version: 0.2.0 ([changelog](CHANGELOG.md))
+- Version: 0.2.1 ([changelog](CHANGELOG.md))
 - Python 3.9 or later (CI runs 3.9 - 3.13)
 - Japanese (full documentation): [README.md](README.md)
 
@@ -119,7 +119,13 @@ One line per TCP conversation (and per UDP flow with `--udp`), times in UTC:
 | `--no-fragments` | do not reassemble IP fragments |
 | `--stats`, `-v`, `--version` | statistics to stderr, verbose logging, version |
 
-Results go to stdout; warnings and statistics go to stderr. Exit codes: `0` ok, `1` runtime error (unreadable file, not a classic PCAP), `2` bad arguments or filter. After `pip install` the command is also available as `pcapreasm`.
+Results go to stdout; warnings and statistics go to stderr. Exit codes: `0` ok, `1` runtime error (unreadable file, not a classic PCAP, output cannot be written, or a file was skipped with `--on-error skip`), `2` bad arguments or filter.
+
+Notes:
+- Only TCP conversations that **carry data** are listed. Handshake-only, refused or reset connections do not appear (same as the library's `on_tcp_conversation`); `--stats` shows the total as `tcp_conversations`.
+- TCP lines are printed in the order conversations are finished, not by start time. UDP lines are sorted by start time.
+- `--udp` keeps one counter per flow in memory, which `--max-memory-mb` does not cover; input with a huge number of distinct UDP sources can use several times the PCAP's size.
+- `-` (stdin) cannot be combined with other files. `-l` lists are UTF-8 (a BOM is accepted); leading/trailing spaces and `#` lines are taken literally as paths. After `pip install` the command is also available as `pcapreasm`.
 
 ## API
 
