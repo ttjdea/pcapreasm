@@ -215,6 +215,7 @@ IPV6_FRAG_NONTRIVIAL_MASK = 0xFFF9  # Offset (13 bits) + M flag (1 bit), excludi
 
 # IP Fragment Reassembly
 IP_MAX_DATAGRAM_LEN = 0x10000   # Maximum reassembled datagram size (65,536 bytes)
+BACKWARD_SWEEP_PACKETS = 1000   # Min packets between sweeps triggered by the capture clock moving backwards
 FRAG_MAX_PIECES = 1400          # Max stored pieces per fragment set (a 68-byte MTU needs 1,366)
 
 # Layer 4 Protocols
@@ -1399,6 +1400,7 @@ class PcapStreamProcessor:
         self._total_bytes = 0
         self._now_ns = 0
         self._last_sweep_ns = 0
+        self._packets_since_backward_sweep = BACKWARD_SWEEP_PACKETS  # The first backward jump sweeps at once
         self._udp_flows: Dict[FlowId, List[UDPDatagram]] = collections.defaultdict(list)
         self._keep_udp_flows = False
         self._refresh_analyzer_flags()
@@ -1454,13 +1456,24 @@ class PcapStreamProcessor:
     # -- Clock & Maintenance ------------------------------------------------
     def _advance_clock(self, timestamp_ns: int) -> None:
         """Advance capture clock and trigger periodic sweep every second."""
-        # The clock follows the capture time of the current packet (it is not a high-water mark):
-        # one packet stamped far in the future must not stop idle/linger/fragment sweeps for the
-        # rest of the run, and files whose timestamps start earlier than the previous file's
-        # must still be swept. A jump in either direction triggers a sweep.
+        # The clock follows the capture time of the current packet (it is not a high-water mark),
+        # so one packet stamped far in the future cannot stop idle/linger/fragment sweeps for the
+        # rest of the run, and a file whose timestamps start earlier than the previous file's is
+        # still swept. A sweep costs O(buffered conversations), so it must stay rare:
+        # - forward progress of one second or more sweeps, as always;
+        # - a backward jump of one second or more (merged interfaces with skewed clocks,
+        #   a new file, or the return from a far-future packet) sweeps and re-bases the
+        #   cadence, but at most once per BACKWARD_SWEEP_PACKETS packets, so timestamps that
+        #   alternate between two clocks cannot trigger a sweep on every packet.
         self._now_ns = timestamp_ns
-        if abs(self._now_ns - self._last_sweep_ns) >= SWEEP_INTERVAL_NS:
-            self._last_sweep_ns = self._now_ns
+        self._packets_since_backward_sweep += 1
+        jump = timestamp_ns - self._last_sweep_ns
+        if jump >= SWEEP_INTERVAL_NS:
+            self._last_sweep_ns = timestamp_ns
+            self._sweep()
+        elif jump <= -SWEEP_INTERVAL_NS and self._packets_since_backward_sweep >= BACKWARD_SWEEP_PACKETS:
+            self._packets_since_backward_sweep = 0
+            self._last_sweep_ns = timestamp_ns
             self._sweep()
 
     def _sweep(self) -> None:

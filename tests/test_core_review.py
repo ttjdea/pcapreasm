@@ -44,6 +44,26 @@ class TestClockIsNotAHighWaterMark(PcapTestCase):
         self.assertEqual(reasons[b"a"], P.EVICT_IDLE)
 
 
+class TestSkewedClocksAreNotQuadratic(PcapTestCase):
+    def test_timestamps_alternating_between_two_clocks_do_not_sweep_on_every_packet(self):
+        # Half-closed conversations stay buffered; a sweep walks all of them.
+        pkts = []
+        for index in range(4000):
+            port = 10_000 + index
+            pkts += [
+                at(0, tcp_pkt(0, C, port, S, 80, 1000, 0, SYN)),
+                at(0, tcp_pkt(0, S, 80, C, port, 5000, 1001, SYN | ACK)),
+                at(0, tcp_pkt(0, C, port, S, 80, 1001, 5001, PSH | ACK, b"data")),
+                at(0, tcp_pkt(0, C, port, S, 80, 1010, 5001, FIN | ACK)),  # gap 1005..1009: never completes
+            ]
+        for index in range(15_000):
+            pkts.append(at(10 + (5 if index % 2 else 0), udp_pkt(0, C, 9, S, 9, b"x")))
+        started = time.perf_counter()
+        _, proc = self.run_pcap(make_pcap(pkts))
+        self.assertLess(time.perf_counter() - started, SLOW_LIMIT_SECONDS)
+        self.assertEqual(proc.stats["packets"], len(pkts))
+
+
 class TestSequenceUnwrapping(PcapTestCase):
     def test_junk_packets_do_not_shift_later_data_by_2_to_the_32(self):
         base = 1000
