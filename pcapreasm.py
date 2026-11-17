@@ -104,6 +104,7 @@ import bisect
 import collections
 import datetime
 import functools
+import heapq
 import ipaddress
 import json
 import logging
@@ -142,7 +143,7 @@ __all__ = [
     "EVICT_MAX_TOTAL_BYTES",
     "EVICT_FLUSH",
 ]
-__version__ = "0.2.1"
+__version__ = "0.2.2"
 
 # -------------------------------------------------------------------------
 # Constants
@@ -214,6 +215,7 @@ IPV6_FRAG_NONTRIVIAL_MASK = 0xFFF9  # Offset (13 bits) + M flag (1 bit), excludi
 
 # IP Fragment Reassembly
 IP_MAX_DATAGRAM_LEN = 0x10000   # Maximum reassembled datagram size (65,536 bytes)
+FRAG_MAX_PIECES = 1400          # Max stored pieces per fragment set (a 68-byte MTU needs 1,366)
 
 # Layer 4 Protocols
 IPPROTO_TCP = 0x06              # TCP Protocol Number
@@ -453,6 +455,8 @@ def _parse_ipv4(ip_packet: bytes) -> Optional[_ParsedIP]:
     # Truncate payload to IP total length to eliminate Ethernet trailer padding.
     # A total length larger than the captured bytes means the capture's snaplen cut the
     # packet short (a total length of 0 is TSO/GSO offload and is not truncation).
+    if 0 < ip_total_len < ip_header_len:
+        return None  # Impossible length: cannot tell payload from link-layer padding
     if ip_header_len <= ip_total_len <= len(ip_packet):
         end, truncated = ip_total_len, False
     else:
@@ -619,6 +623,54 @@ class _Intervals:
         return base
 
 
+class _ContiguousCover:
+    """Tracks the lowest contiguous block of received byte ranges.
+
+    Answers "is everything from `base` up to X present?" for a TCP stream whose segments keep
+    arriving (in any order) after the FIN. Blocks above the first gap wait in a min-heap and are
+    absorbed once the gap is filled, so each segment costs O(log n) amortised, whatever the
+    arrival order (a sorted list would be O(n) per out-of-order insertion).
+    """
+
+    __slots__ = ("lo", "hi", "heap")
+
+    def __init__(self) -> None:
+        self.lo: Optional[int] = None  # Start of the lowest block
+        self.hi = 0                    # End (exclusive) of the lowest block
+        self.heap: List[Tuple[int, int]] = []  # Other blocks (all start above `hi`)
+
+    def add(self, start: int, end: int) -> None:
+        if end <= start:
+            return
+        lo = self.lo
+        if lo is None:
+            self.lo, self.hi = start, end
+        elif start < lo:
+            if end >= lo:
+                self.lo = start
+                self.hi = max(self.hi, end)
+            else:  # A new lowest block separated by a gap; the old one waits in the heap
+                heapq.heappush(self.heap, (lo, self.hi))
+                self.lo, self.hi = start, end
+        elif start <= self.hi:
+            if end > self.hi:
+                self.hi = end
+        else:
+            heapq.heappush(self.heap, (start, end))
+            return
+        heap = self.heap
+        while heap and heap[0][0] <= self.hi:
+            block_end = heapq.heappop(heap)[1]
+            if block_end > self.hi:
+                self.hi = block_end
+
+    def reach(self, base: int) -> int:
+        """End of the contiguous coverage containing `base` (or `base` if none does)."""
+        if self.lo is not None and self.lo <= base < self.hi:
+            return self.hi
+        return base
+
+
 class _FragmentSet:
     """Container for fragments belonging to a single IP datagram."""
 
@@ -659,7 +711,8 @@ class _FragmentReassembler:
         """Add a fragment piece and return reassembled L4 payload if complete.
 
         Pieces that add no new byte range (duplicates, fully overlapped) are not stored, so
-        the earliest-received bytes win and buffered size stays bounded. `last_truncated`
+        buffered size stays bounded. Pieces are stored whole, so where two stored pieces overlap
+        the one with the lower offset supplies the overlapping bytes. `last_truncated`
         reports, after a successful return, whether any piece was cut short by snaplen.
         """
         self.expire(timestamp_ns)
@@ -684,6 +737,10 @@ class _FragmentReassembler:
         if fragment_set.cover.add(offset, offset + len(data)):
             fragment_set.pieces.append((offset, data))
             fragment_set.size += len(data)
+            if len(fragment_set.pieces) > FRAG_MAX_PIECES:
+                del self._sets[key]
+                self._stats["frag_too_many_pieces"] += 1
+                return None
 
         if not more_fragments:
             end = offset + len(data)
@@ -742,6 +799,9 @@ class _FragmentReassembler:
 # -------------------------------------------------------------------------
 # TCP Stream Reassembly Core
 # -------------------------------------------------------------------------
+_SEQ_FOLLOW_LIMIT = 1 << 30  # Max sequence step that moves the unwrapping reference
+
+
 class _TCPReassembler:
     """Reassembles a single unidirectional TCP stream."""
 
@@ -759,8 +819,9 @@ class _TCPReassembler:
         self._finished_cache: Optional[bool] = None
         # Byte ranges received, built lazily the first time FIN-completeness is checked and
         # then updated incrementally (see `_covers_up_to_fin`).
-        self._cover: Optional[_Intervals] = None
+        self._cover: Optional[_ContiguousCover] = None
         self._cover_n = 0  # Number of `chunks` already folded into `_cover`
+        self._cover_base: Optional[int] = None  # `start_seq` the cover was built for
 
     @property
     def has_data(self) -> bool:
@@ -774,8 +835,12 @@ class _TCPReassembler:
             return seq
         delta = ((seq - self._ref_raw_seq + 0x80000000) & 0xFFFFFFFF) - 0x80000000
         unwrapped_seq = self._ref_unwrapped_seq + delta
-        self._ref_raw_seq = seq
-        self._ref_unwrapped_seq = unwrapped_seq
+        # Follow the stream only through small steps. A packet far from the reference (a junk or
+        # spoofed packet) is placed relative to the unchanged reference but does not move it,
+        # so a few such packets cannot accumulate a 2**32 error for the genuine packets after them.
+        if -_SEQ_FOLLOW_LIMIT < delta < _SEQ_FOLLOW_LIMIT:
+            self._ref_raw_seq = seq
+            self._ref_unwrapped_seq = unwrapped_seq
         return unwrapped_seq
 
     def add(self, seq: int, payload: bytes, timestamp_ns: int, flags: int, truncated: bool = False) -> int:
@@ -824,21 +889,22 @@ class _TCPReassembler:
         stays unfilled) costs O(log n) per segment rather than a full re-sort each time.
         """
         assert self.fin_seq is not None
+        base = self.start_seq
         cover = self._cover
-        if cover is None:
-            cover = self._cover = _Intervals()
+        if cover is None or self._cover_base != base:
+            # (Re)build: the first check, or the SYN arrived/changed after data was already folded in.
+            cover = self._cover = _ContiguousCover()
+            self._cover_n = 0
+            self._cover_base = base
         chunks = self.chunks
         for index in range(self._cover_n, len(chunks)):
             seq, payload, _ = chunks[index]
-            cover.add(seq, seq + len(payload))
+            start = seq if base is None or seq > base else base  # Bytes before the SYN do not count
+            cover.add(start, seq + len(payload))
         self._cover_n = len(chunks)
 
-        if self.start_seq is not None:
-            base = self.start_seq
-        elif cover.starts:
-            base = cover.starts[0]
-        else:
-            base = self.fin_seq
+        if base is None:
+            base = cover.lo if cover.lo is not None else self.fin_seq
         return cover.reach(base) >= self.fin_seq
 
     def reassemble(self) -> Tuple[bytes, List[Tuple[int, bytes]], List[Tuple[int, int]], int]:
@@ -1388,9 +1454,12 @@ class PcapStreamProcessor:
     # -- Clock & Maintenance ------------------------------------------------
     def _advance_clock(self, timestamp_ns: int) -> None:
         """Advance capture clock and trigger periodic sweep every second."""
-        if timestamp_ns > self._now_ns:
-            self._now_ns = timestamp_ns
-        if self._now_ns - self._last_sweep_ns >= SWEEP_INTERVAL_NS:
+        # The clock follows the capture time of the current packet (it is not a high-water mark):
+        # one packet stamped far in the future must not stop idle/linger/fragment sweeps for the
+        # rest of the run, and files whose timestamps start earlier than the previous file's
+        # must still be swept. A jump in either direction triggers a sweep.
+        self._now_ns = timestamp_ns
+        if abs(self._now_ns - self._last_sweep_ns) >= SWEEP_INTERVAL_NS:
             self._last_sweep_ns = self._now_ns
             self._sweep()
 

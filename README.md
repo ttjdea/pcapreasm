@@ -3,7 +3,7 @@
 PCAP キャプチャから TCP / UDP の通信内容(アプリケーション層のデータ)を取り出す、**標準ライブラリのみ**の Python モジュールです。単一ファイル `pcapreasm.py` で完結し、外部パッケージは不要です。
 
 - ライセンス: MPL-2.0
-- バージョン: 0.2.1([変更履歴](CHANGELOG.md))
+- バージョン: 0.2.2([変更履歴](CHANGELOG.md))
 - 動作環境: Python 3.9 以上(CI は 3.9〜3.13 で実行)
 - English: [README.en.md](README.en.md)
 
@@ -382,7 +382,7 @@ PcapStreamProcessor(
 | `fragments_dropped` | `reassemble_fragments=False` により破棄したフラグメント数 |
 | `frag_reassembled` | 再構成に成功した数 |
 | `frag_expired` / `frag_evicted` | タイムアウト / 件数上限で破棄した未完成集合の数 |
-| `frag_too_large` / `frag_conflict` | サイズ超過 / 長さの矛盾で破棄した数 |
+| `frag_too_large` / `frag_conflict` / `frag_too_many_pieces` | サイズ超過 / 長さの矛盾 / 断片の数が多すぎる(1 つの IP データグラムあたり 1,400 個超)ために破棄した数(最後は 0.2.2 で追加) |
 | `frag_incomplete_at_flush` | flush 時点で未完成だった集合の数 |
 | `read_errors` | ファイル読み込み中の OSError 回数 |
 
@@ -570,7 +570,7 @@ logging.basicConfig(level=logging.INFO)   # INFO にするとファイル名も�
 
 **その他**
 - スレッドセーフではありません。1 つの `PcapStreamProcessor` は 1 つのスレッドから使ってください。
-- 時間に関する処理(`idle_timeout` など)はすべてキャプチャ時刻に基づきます。
+- 時間に関する処理(`idle_timeout` など)はすべてキャプチャ時刻に基づきます。時計は「いま処理しているパケットの時刻」に従い、1 秒以上のずれ(進む方向も戻る方向も)があるたびに掃除します(0.2.1 までは最大値を基準にしていた)。時刻が大きく先に進んだパケットが 1 つあると、その時点でアイドルの会話がまとめて確定されますが、その後の掃除は正常に続きます。
 
 ---
 

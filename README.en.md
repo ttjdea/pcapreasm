@@ -3,7 +3,7 @@
 A **standard-library-only** Python module that extracts TCP / UDP application-layer data from PCAP captures. It is a single file, `pcapreasm.py`, with no dependencies.
 
 - License: MPL-2.0
-- Version: 0.2.1 ([changelog](CHANGELOG.md))
+- Version: 0.2.2 ([changelog](CHANGELOG.md))
 - Python 3.9 or later (CI runs 3.9 - 3.13)
 - Japanese (full documentation): [README.md](README.md)
 
@@ -191,7 +191,7 @@ Override only what you need. By default an exception in a callback is logged and
 
 ### Statistics (`stats`)
 
-`files`, `failed_files`, `packets`, `non_ip`, `bad_ip` / `bad_tcp` / `bad_udp`, `truncated_packets`, `filtered`, `orphan_packets`, `late_packets` (data, SYN, FIN or RST arriving after a connection was delivered), `late_acks` (bare ACKs after delivery, e.g. the last ACK of a normal close), `tcp_conversations`, `evict_<reason>` (e.g. `evict_fin`), `fragments`, `fragments_dropped`, `frag_reassembled`, `frag_expired`, `frag_evicted`, `frag_too_large`, `frag_conflict`, `frag_incomplete_at_flush`, `read_errors`.
+`files`, `failed_files`, `packets`, `non_ip`, `bad_ip` / `bad_tcp` / `bad_udp`, `truncated_packets`, `filtered`, `orphan_packets`, `late_packets` (data, SYN, FIN or RST arriving after a connection was delivered), `late_acks` (bare ACKs after delivery, e.g. the last ACK of a normal close), `tcp_conversations`, `evict_<reason>` (e.g. `evict_fin`), `fragments`, `fragments_dropped`, `frag_reassembled`, `frag_expired`, `frag_evicted`, `frag_too_large`, `frag_conflict`, `frag_too_many_pieces` (more than 1,400 pieces for one IP datagram; added in 0.2.2), `frag_incomplete_at_flush`, `read_errors`.
 
 ## Filter expressions
 
