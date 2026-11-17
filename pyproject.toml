@@ -22,7 +22,7 @@ classifiers = [
 ]
 
 [project.scripts]
-pcapreasm = "pcapreasm:main"
+pcapreasm = "pcapreasm:_script_main"
 
 [project.urls]
 Homepage = "https://github.com/ttjdea/pcapreasm"

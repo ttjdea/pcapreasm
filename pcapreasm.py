@@ -107,6 +107,7 @@ import functools
 import ipaddress
 import json
 import logging
+import math
 import os
 import re
 import socket
@@ -141,7 +142,7 @@ __all__ = [
     "EVICT_MAX_TOTAL_BYTES",
     "EVICT_FLUSH",
 ]
-__version__ = "0.2.0"
+__version__ = "0.2.1"
 
 # -------------------------------------------------------------------------
 # Constants
@@ -1811,6 +1812,20 @@ def _format_timestamp(timestamp_ns: int) -> str:
     return "%s.%03dZ" % (moment.strftime("%Y-%m-%dT%H:%M:%S"), nanos // 1_000_000)
 
 
+class _OutputStopped(BaseException):
+    """Raised inside the command line's analyzer when stdout cannot be written to.
+
+    `error` is None for a closed pipe (normal, e.g. `| head`), otherwise the cause.
+    """
+
+    def __init__(self, error: Optional[BaseException]) -> None:
+        super().__init__(error)
+        self.error = error
+
+
+_cli_output_failed = False  # set by main(); _script_main() then silences the interpreter's own flush at exit
+
+
 def _silence_stdout() -> None:
     """After a broken pipe, point stdout at /dev/null so Python does not complain again at exit."""
     try:
@@ -1837,9 +1852,10 @@ class _SummaryAnalyzer(BaseAnalyzer):
         try:
             self._out.write(line)
         except BrokenPipeError:
-            # e.g. `| head`. SystemExit is not swallowed by the analyzer error handling.
-            _silence_stdout()
-            raise SystemExit(0) from None
+            # e.g. `| head`. A BaseException is not swallowed by the analyzer error handling.
+            raise _OutputStopped(None) from None
+        except (OSError, ValueError, AttributeError) as error:  # disk full, closed or missing stdout
+            raise _OutputStopped(error) from None
 
     def on_tcp_conversation(self, conversation: TCPConversation) -> None:
         client, server = conversation.client, conversation.server
@@ -1923,7 +1939,20 @@ def _build_argument_parser() -> "argparse.ArgumentParser":
 
 
 def main(argv: Optional[List[str]] = None) -> int:
-    """Command line entry point. Returns the process exit code (0 ok, 1 runtime error, 2 usage error)."""
+    """Command line entry point.
+
+    Returns the exit code instead of exiting: 0 ok, 1 runtime error (unreadable file, not a classic
+    PCAP, output cannot be written, or a file skipped with `--on-error skip`), 2 usage error.
+    """
+    try:
+        return _run_cli(argv)
+    except SystemExit as stop:  # argparse: --help / --version / usage errors
+        code = stop.code
+        return code if isinstance(code, int) else (0 if code is None else 1)
+
+
+def _run_cli(argv: Optional[List[str]]) -> int:
+    global _cli_output_failed
     parser = _build_argument_parser()
     args = parser.parse_args(argv)
 
@@ -1936,17 +1965,24 @@ def main(argv: Optional[List[str]] = None) -> int:
     paths: List[str] = list(args.pcap)
     try:
         for list_path in args.file_list:
-            with open(list_path, "r", encoding="utf-8", errors="surrogateescape") as handle:
+            with open(list_path, "r", encoding="utf-8-sig", errors="surrogateescape") as handle:
                 paths.extend(line.rstrip("\r\n") for line in handle if line.strip())
     except OSError as error:
         print("Error: %s" % error, file=sys.stderr)
         return 1
     if not paths:
         parser.error("no PCAP files given")
-    if args.idle_timeout < 0 or args.max_memory_mb < 0 or args.max_conversations < 1:
-        parser.error("--idle-timeout and --max-memory-mb must be >= 0, --max-conversations >= 1")
+    if "-" in paths and paths != ["-"]:
+        parser.error("'-' (standard input) cannot be combined with other files")
+    if not math.isfinite(args.idle_timeout) or args.idle_timeout < 0:
+        parser.error("--idle-timeout must be a finite number >= 0")
+    if args.max_memory_mb < 0 or args.max_conversations < 1:
+        parser.error("--max-memory-mb must be >= 0 and --max-conversations >= 1")
 
     out = sys.stdout
+    if out is None:
+        print("Error: standard output is not available", file=sys.stderr)
+        return 1
     try:
         processor = PcapStreamProcessor(
             analyzers=[_SummaryAnalyzer(out, args.format, args.udp)],
@@ -1961,20 +1997,43 @@ def main(argv: Optional[List[str]] = None) -> int:
 
     try:
         if paths == ["-"]:
-            processor.process_stream(sys.stdin.buffer, name="<stdin>")
+            stdin = getattr(sys.stdin, "buffer", None)
+            if stdin is None:
+                print("Error: standard input is not available", file=sys.stderr)
+                return 1
+            processor.process_stream(stdin, name="<stdin>")
         else:
             processor.process_files(paths, on_error=args.on_error)
         out.flush()
+    except _OutputStopped as stopped:
+        _cli_output_failed = True
+        if stopped.error is None:
+            return 0
+        print("Error: cannot write to standard output: %s" % stopped.error, file=sys.stderr)
+        return 1
     except BrokenPipeError:
-        _silence_stdout()
+        _cli_output_failed = True
         return 0
-    except (OSError, ValueError) as error:  # unreadable file, not a classic PCAP
+    except (OSError, ValueError) as error:  # unreadable file, not a classic PCAP, or a failed flush
+        _cli_output_failed = isinstance(error, OSError) and error.errno is not None and error.filename is None
         print("Error: %s" % error, file=sys.stderr)
         return 1
     if args.stats or args.verbose:
         print("[stats] %s" % dict(sorted(processor.stats.items())), file=sys.stderr)
+    failed = processor.stats.get("failed_files", 0)
+    if failed:
+        print("Error: %d file(s) could not be read (skipped)" % failed, file=sys.stderr)
+        return 1
     return 0
 
 
+def _script_main() -> int:
+    """Entry point for `python -m pcapreasm` and the `pcapreasm` command."""
+    code = main()
+    if _cli_output_failed:
+        _silence_stdout()  # keep the interpreter from reporting the same output error again at exit
+    return code
+
+
 if __name__ == "__main__":
-    sys.exit(main())
+    sys.exit(_script_main())
