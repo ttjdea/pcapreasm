@@ -3,8 +3,8 @@
 PCAP キャプチャから TCP / UDP の通信内容(アプリケーション層のデータ)を取り出す、**標準ライブラリのみ**の Python モジュールです。単一ファイル `pcapreasm.py` で完結し、外部パッケージは不要です。
 
 - ライセンス: MPL-2.0
-- バージョン: 0.1.0([変更履歴](CHANGELOG.md))
-- 動作環境: Python 3.7 以上(CI は 3.7〜3.13 で実行)
+- バージョン: 0.2.0([変更履歴](CHANGELOG.md))
+- 動作環境: Python 3.9 以上(CI は 3.9〜3.13 で実行)
 - English: [README.en.md](README.en.md)
 
 ---
@@ -186,7 +186,6 @@ proc = PcapStreamProcessor(
     max_conversation_bytes=64 * 1024**2,    # 1 conversation あたり 64 MiB
     max_total_bytes=1024**3,                # 全体で 1 GiB
     idle_timeout=120,                       # 120 秒(キャプチャ時刻基準)無通信で確定
-    segment_overhead_bytes=100,             # 小さなセグメントが多くても上限が実メモリに近づく
 )
 proc.process_file("sample.pcap")
 print(dict(proc.stats))
@@ -231,6 +230,41 @@ proc = PcapStreamProcessor(analyzers=[Printer()])
 with gzip.open("sample.pcap.gz", "rb") as stream:
     proc.process_stream(stream, name="sample.pcap.gz")   # name は警告やエラーメッセージに出る
 ```
+
+### 3.10 コマンドラインで使う(0.2.0 で追加)
+
+コードを書かずに、会話の一覧を見たり、フィルタ式を試したりできます。
+
+```text
+python -m pcapreasm capture.pcap
+python -m pcapreasm a.pcap b.pcap -f "tcp and port 80" --udp
+python -m pcapreasm -l files.txt --format jsonl > conversations.jsonl
+zcat capture.pcap.gz | python -m pcapreasm -
+```
+
+出力は 1 つの TCP 会話(または、`--udp` を付けたときの UDP フロー)につき 1 行です。時刻は UTC です。
+
+```text
+2026-11-16T12:34:56.789Z TCP 10.0.0.1:1234 -> 10.0.0.2:80 c2s=18B s2c=11B gaps=0 end=fin
+```
+
+| オプション | 説明 |
+|---|---|
+| `pcap ...` | PCAP ファイル(時刻順)。`-` は標準入力(1 つだけ) |
+| `-l`, `--file-list FILE` | 1 行 1 ファイルのリスト(空行は無視)。複数指定可 |
+| `-f`, `--filter EXPR` | tcpdump 式のフィルタ(「6. フィルタ式」)。式が誤っていれば終了コード 2 |
+| `--udp` | UDP フロー(送信元・宛先ごとのデータグラム数とバイト数)も表示 |
+| `--format text|jsonl` | 出力形式(既定 `text`)。`jsonl` は 1 行 1 JSON |
+| `--on-error raise|skip` | 読めないファイルがあったとき、止める(既定)/ 飛ばして続ける |
+| `--idle-timeout SEC` | 無通信の会話を確定するまでの秒数(既定 300、`0` で無効) |
+| `--max-memory-mb MB` | 保持するバッファの上限(既定 1024、`0` で無制限) |
+| `--max-conversations N` | 同時に保持する TCP 会話数(既定 5000) |
+| `--no-fragments` | IP フラグメントを再構成しない |
+| `--stats` | 処理統計を標準エラーに出す |
+| `-v`, `--verbose` | 詳細ログ |
+| `--version` | バージョンを表示 |
+
+結果は標準出力、警告と統計は標準エラーに出ます。終了コードは、正常が `0`、ファイルが読めないなどの実行時エラーが `1`、引数やフィルタ式の誤りが `2` です。`pip install` した環境では `pcapreasm` コマンドでも呼べます。
 
 ---
 
@@ -287,7 +321,7 @@ PcapStreamProcessor(
     fragment_timeout=30.0,
     max_fragment_sets=1024,
     raise_on_analyzer_error=False,   # 0.1.0 で追加
-    segment_overhead_bytes=0,        # 0.1.0 で追加
+    segment_overhead_bytes=150,      # 0.1.0 で追加(既定は 0.2.0 で 0 から 150 に変更)
     packet_filter=None,              # 0.1.0 で追加
     filter_expr=None,                # 0.1.0 で追加
 )
@@ -308,7 +342,7 @@ PcapStreamProcessor(
 | `fragment_timeout` | `30.0` | 未完成のフラグメント集合を破棄するまでの秒数 |
 | `max_fragment_sets` | `1024` | 同時に保持する未完成フラグメント集合の数 |
 | `raise_on_analyzer_error` | `False` | `True` にすると、analyzer のコールバックで起きた例外を握りつぶさず `AnalyzerError` として送出する(テストやバッチ処理向け) |
-| `segment_overhead_bytes` | `0` | 保持している 1 セグメントごとに、ペイロードに加えて数えるバイト数。小さなセグメントが多いと、ペイロードだけでは実メモリより大幅に少なく見える。`100` 程度にすると、上限が実メモリに近づく(測定例は「9. 制限事項」のメモリ)。`0` は 0.0.x と同じ(ペイロードのみ) |
+| `segment_overhead_bytes` | `150` | 保持している 1 セグメントごとに、ペイロードに加えて数えるバイト数。小さなセグメントが多いと、ペイロードだけでは実メモリより大幅に少なく見えるため、既定でオブジェクト管理分(実測で 1 セグメントあたり 110〜220 バイト)を加算して、上限が実メモリに近づくようにしている(測定例は「9. 制限事項」のメモリ)。`0` にすると 0.0.x/0.1.x と同じ(ペイロードのみ)。**0.2.0 で既定を `0` から `150` に変更**(同じ上限値でも、古い接続が早く確定される) |
 | `packet_filter` | `None` | `f(ip_proto, flow_id) -> bool`。`False` を返したパケットを捨てる。`ip_proto` は TCP が `6`、UDP が `17`。例外を出すと `AnalyzerError` になる |
 | `filter_expr` | `None` | tcpdump 式の部分集合(「6. フィルタ式」)。`packet_filter` と同時に指定すると AND |
 
@@ -501,7 +535,7 @@ logging.basicConfig(level=logging.INFO)   # INFO にするとファイル名も�
 使う前に把握しておいてほしい点です。
 
 **入力形式**
-- クラシック PCAP のみ対応です。**pcapng(Wireshark の既定形式)は読めず**、`PcapFormatError`(`ValueError` の一種)になります。メッセージに pcapng であることと変換方法が出ます。Wireshark で「pcap 形式」として保存し直すか、`editcap -F pcap in.pcapng out.pcap` で変換してください。pcapng への対応は 0.2.x を予定しています。
+- クラシック PCAP のみ対応です。**pcapng(Wireshark の既定形式)は読めず**、`PcapFormatError`(`ValueError` の一種)になります。メッセージに pcapng であることと変換方法が出ます。Wireshark で「pcap 形式」として保存し直すか、`editcap -F pcap in.pcapng out.pcap` で変換してください。pcapng への対応は予定していません。
 - 圧縮ファイル(`.gz` など)は `process_file` では読めません。`gzip.open(path, "rb")` などで開いて `process_stream` に渡してください(「3.9 圧縮された PCAP を読む」を参照)。
 
 **再構成の挙動**
@@ -520,7 +554,7 @@ logging.basicConfig(level=logging.INFO)   # INFO にするとファイル名も�
 
 **メモリ**
 - 既定では `max_conversation_bytes` と `max_total_bytes` が無制限です。大きな PCAP では上記 3.7 のように上限を設定してください。
-- 上限はペイロードのバイト数で数えるため、小さなセグメントが多いと実メモリを大きく下回ります。測定例(40 バイトのセグメント 50 万個、`max_total_bytes` = 16 MiB): 実メモリの増加は `segment_overhead_bytes=0` で約 89 MiB、`100` で約 27 MiB、`150` で約 21 MiB でした。上限に早く達する分、通知されるストリームは 593 個(`0`)から 2,162 個(`100`)に増えます(上限が効いたぶん、1 つの接続が分割されやすくなる)。環境やデータにより変わるため、実際の入力で確かめてください。0.1.x の既定値は 0.0.x との互換のため `0` のままです。
+- 上限は、既定ではペイロードに 1 セグメントあたり 150 バイト(`segment_overhead_bytes`)を加えて数えます。`0` にするとペイロードだけを数え、小さなセグメントが多いときに実メモリを大きく下回ります。測定例(40 バイトのセグメント 50 万個、`max_total_bytes` = 16 MiB): 実メモリの増加は `segment_overhead_bytes=0` で約 89 MiB、`100` で約 27 MiB、`150` で約 21 MiB でした。上限に早く達する分、通知されるストリームは 593 個(`0`)から 2,162 個(`100`)、2,822 個(`150`)に増えます(上限が効いたぶん、1 つの接続が分割されやすくなる)。環境やデータにより変わるため、実際の入力で確かめてください。0.1.x までの既定は `0` でした。
 - 上限に達して確定すると、1 つの接続が複数のストリームに分かれて通知されます。
 - 確定時には再構成した `data` と `timeline` が同時にメモリ上に存在するため、一時的に追加のメモリが必要になります。
 - `on_udp_flow` を実装すると、UDP データグラムを flush まですべて保持します。

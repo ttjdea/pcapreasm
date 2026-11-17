@@ -500,7 +500,8 @@ class TestAnalyzerAndLimits(PcapTestCase):
             tcp_pkt(0, C, 1111, S, 80, 1000, 0, PSH | ACK, b"A" * 100),
             tcp_pkt(1, C, 2222, S, 80, 1000, 0, PSH | ACK, b"B" * 100),
         ]
-        rec, _ = self.run_pcap(make_pcap(pkts), max_total_bytes=150)
+        # 0.0.x semantics (payload bytes only); the default counts 150 extra bytes per segment since 0.2.0
+        rec, _ = self.run_pcap(make_pcap(pkts), max_total_bytes=150, segment_overhead_bytes=0)
         reasons = {s[1][:1]: s[2].evict_reason for s in rec.streams}
         self.assertEqual(reasons[b"A"], P.EVICT_MAX_TOTAL_BYTES)
         self.assertEqual(reasons[b"B"], P.EVICT_FLUSH)

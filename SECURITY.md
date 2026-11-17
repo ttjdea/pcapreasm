@@ -8,7 +8,7 @@
 
 ## 信頼できない pcap を処理するとき
 
-pcapreasm は外部入力(pcap)を読むライブラリです。0.1.0 では次を確認しています。
+pcapreasm は外部入力(pcap)を読むライブラリです。0.2.0 では次を確認しています。
 
 - 壊れた入力(バイト列をランダムに書き換えた入力、途中で切れた入力)で想定外の例外を出さないこと(`tests/test_robustness.py`)。
 - 細工された入力による CPU の二次計算量が起きないこと(IP フラグメント、FIN 後の TCP)。
@@ -16,11 +16,11 @@ pcapreasm は外部入力(pcap)を読むライブラリです。0.1.0 では次�
 
 それでも、信頼できない pcap を扱うときは次の対策を入れてください。
 
-- メモリ上限を必ず設定する(既定は無制限です)。`max_conversations`、`max_conversation_bytes`、`max_total_bytes`、`idle_timeout`、`max_fragment_sets` に加え、小さなセグメントが多い入力では `segment_overhead_bytes=100` 程度を設定すると、上限が実メモリに近づきます。
+- メモリ上限を必ず設定する(既定は無制限です)。`max_conversations`、`max_conversation_bytes`、`max_total_bytes`、`idle_timeout`、`max_fragment_sets` を設定してください。`segment_overhead_bytes` の既定(150)は、小さなセグメントが多い入力でも上限が実メモリに近づくための値です(`0` にしないでください)。
 - 処理を別プロセスにして、CPU 時間・メモリ・実行時間(`ulimit` / `resource` / コンテナの制限)で制限する。
 - 上限に達すると、ストリームが分割されて通知されます。`meta.evict_reason` を確認してください。
 - analyzer 側で、受け取った `data` を信頼しない(復号・解凍・デシリアライズ前に長さや形式を検証する)。
 
 ## 対象バージョン
 
-最新の 0.1.x のみ修正の対象です。
+最新の 0.2.x のみ修正の対象です。

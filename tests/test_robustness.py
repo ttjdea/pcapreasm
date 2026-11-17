@@ -546,8 +546,19 @@ class TestSegmentOverhead(PcapTestCase):
         tcp_pkt(1, C, 1111, S, 80, 1010, 0, PSH | ACK, b"0123456789"),
     ]
 
-    def test_default_counts_payload_only(self):
-        rec, _ = self.run_pcap(make_pcap(self.PKTS), max_conversation_bytes=1500)
+    def test_zero_counts_payload_only(self):
+        rec, _ = self.run_pcap(make_pcap(self.PKTS), max_conversation_bytes=1500, segment_overhead_bytes=0)
+        self.assertNotIn(P.EVICT_MAX_BYTES, [s[2].evict_reason for s in rec.streams])
+
+    def test_default_is_150_bytes_per_segment(self):
+        import inspect
+
+        default = inspect.signature(P.PcapStreamProcessor).parameters["segment_overhead_bytes"].default
+        self.assertEqual(default, 150)
+        # 2 segments x (10 payload + 150) = 320 bytes: limit 319 evicts, 320 does not.
+        rec, _ = self.run_pcap(make_pcap(self.PKTS), max_conversation_bytes=319)
+        self.assertIn(P.EVICT_MAX_BYTES, [s[2].evict_reason for s in rec.streams])
+        rec, _ = self.run_pcap(make_pcap(self.PKTS), max_conversation_bytes=320)
         self.assertNotIn(P.EVICT_MAX_BYTES, [s[2].evict_reason for s in rec.streams])
 
     def test_overhead_makes_small_segments_count_more(self):

@@ -7,7 +7,7 @@ name = "pcapreasm"
 dynamic = ["version"]
 description = "Extract TCP/UDP application-layer streams from classic PCAP files (single file, standard library only)"
 readme = "README.md"
-requires-python = ">=3.7"
+requires-python = ">=3.9"
 license = { text = "MPL-2.0" }
 authors = [{ name = "ttjdea" }]
 keywords = ["pcap", "tcp", "udp", "reassembly", "network", "forensics"]
@@ -16,9 +16,13 @@ classifiers = [
     "Intended Audience :: Developers",
     "License :: OSI Approved :: Mozilla Public License 2.0 (MPL 2.0)",
     "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3 :: Only",
     "Topic :: System :: Networking :: Monitoring",
     "Topic :: Software Development :: Libraries :: Python Modules",
 ]
+
+[project.scripts]
+pcapreasm = "pcapreasm:main"
 
 [project.urls]
 Homepage = "https://github.com/ttjdea/pcapreasm"
@@ -31,11 +35,11 @@ py-modules = ["pcapreasm"]
 [tool.setuptools.dynamic]
 version = { attr = "pcapreasm.__version__" }
 
-# Python 3.7 is still supported in 0.1.x, so syntax that needs a newer Python
-# (e.g. `X | None` annotations, which ruff's "UP" rules would force) must not be introduced.
+# Python 3.9 is the minimum, so syntax that needs a newer Python (e.g. `X | None` annotations,
+# which ruff's "UP" rules would force) must not be introduced.
 [tool.ruff]
 line-length = 120
-target-version = "py37"
+target-version = "py39"
 
 [tool.ruff.lint]
 select = ["E", "F", "W", "B"]

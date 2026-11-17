@@ -3,8 +3,8 @@
 A **standard-library-only** Python module that extracts TCP / UDP application-layer data from PCAP captures. It is a single file, `pcapreasm.py`, with no dependencies.
 
 - License: MPL-2.0
-- Version: 0.1.0 ([changelog](CHANGELOG.md))
-- Python 3.7 or later (CI runs 3.7 - 3.13)
+- Version: 0.2.0 ([changelog](CHANGELOG.md))
+- Python 3.9 or later (CI runs 3.9 - 3.13)
 - Japanese (full documentation): [README.md](README.md)
 
 ## Features
@@ -87,9 +87,39 @@ proc = PcapStreamProcessor(
     max_conversation_bytes=64 * 1024**2,
     max_total_bytes=1024**3,
     idle_timeout=120,               # seconds of *capture* time
-    segment_overhead_bytes=100,     # count per-segment bookkeeping too (see "Limitations")
 )
 ```
+
+## Command line (added in 0.2.0)
+
+```text
+python -m pcapreasm capture.pcap
+python -m pcapreasm a.pcap b.pcap -f "tcp and port 80" --udp
+python -m pcapreasm -l files.txt --format jsonl > conversations.jsonl
+zcat capture.pcap.gz | python -m pcapreasm -
+```
+
+One line per TCP conversation (and per UDP flow with `--udp`), times in UTC:
+
+```text
+2026-11-16T12:34:56.789Z TCP 10.0.0.1:1234 -> 10.0.0.2:80 c2s=18B s2c=11B gaps=0 end=fin
+```
+
+| Option | Meaning |
+|---|---|
+| `pcap ...` | PCAP files in chronological order; `-` reads one file from stdin |
+| `-l`, `--file-list FILE` | file with one path per line (blank lines ignored); repeatable |
+| `-f`, `--filter EXPR` | tcpdump-style filter (see "Filter expressions"); a bad expression exits with 2 |
+| `--udp` | also print UDP flows (datagram and byte counts per source/destination) |
+| `--format text|jsonl` | output format (default `text`) |
+| `--on-error raise|skip` | stop (default) or skip an unreadable file |
+| `--idle-timeout SEC` | finish a conversation idle for SEC seconds of capture time (default 300, `0` = off) |
+| `--max-memory-mb MB` | buffer limit (default 1024, `0` = unlimited) |
+| `--max-conversations N` | simultaneously tracked TCP conversations (default 5000) |
+| `--no-fragments` | do not reassemble IP fragments |
+| `--stats`, `-v`, `--version` | statistics to stderr, verbose logging, version |
+
+Results go to stdout; warnings and statistics go to stderr. Exit codes: `0` ok, `1` runtime error (unreadable file, not a classic PCAP), `2` bad arguments or filter. After `pip install` the command is also available as `pcapreasm`.
 
 ## API
 
@@ -108,7 +138,7 @@ proc = PcapStreamProcessor(
 | `fragment_timeout` | `30.0` | Seconds before an incomplete fragment set is discarded |
 | `max_fragment_sets` | `1024` | Max incomplete fragment sets held |
 | `raise_on_analyzer_error` | `False` | Raise `AnalyzerError` when an analyzer callback fails instead of logging it (added in 0.1.0) |
-| `segment_overhead_bytes` | `0` | Bytes counted per buffered segment on top of its payload when checking the byte limits. `0` keeps 0.0.x behaviour (added in 0.1.0) |
+| `segment_overhead_bytes` | `150` | Bytes counted per buffered segment on top of its payload when checking the byte limits, so that the limits track real memory (about 110-220 bytes per segment were measured). `0` keeps the 0.0.x/0.1.x behaviour (payload only). Added in 0.1.0 with default `0`; **the default became `150` in 0.2.0**, so the same limits now finish old conversations earlier |
 | `packet_filter` | `None` | `f(ip_proto, flow_id) -> bool`; return `False` to drop the packet. An exception becomes `AnalyzerError` (added in 0.1.0) |
 | `filter_expr` | `None` | tcpdump-style expression; ANDed with `packet_filter` (added in 0.1.0) |
 
@@ -186,14 +216,14 @@ Notes: an expression that matches one direction only (`src port 80`) delivers on
 
 ## Limitations
 
-- **Classic PCAP only.** pcapng raises `PcapFormatError` with the conversion hint (`editcap -F pcap in.pcapng out.pcap`). pcapng support is planned for 0.2.x.
+- **Classic PCAP only.** pcapng raises `PcapFormatError` with the conversion hint (`editcap -F pcap in.pcapng out.pcap`). pcapng support is not planned.
 - Compressed files: open them yourself and use `process_stream`.
 - Gaps are not padded: `data` skips missing bytes, so offsets after a gap shift; use `meta.gaps`.
 - Overlapping segments: the earliest-arriving data wins; OS-specific reassembly policies are not reproduced. Checksums are not verified.
 - A half-closed connection (only one side sent FIN) is never timed out by `close_linger`; it ends by the peer's FIN/RST, `idle_timeout`, a limit, or `flush()`. Without `idle_timeout` such connections stay in memory until `max_conversations` is reached.
 - A reused 4-tuple is split into separate connections by the new SYN's initial sequence number (same number = SYN retransmission) or, if that side has not sent a SYN yet, by leftover data from the previous connection in either direction.
 - No decryption, no tunnel decapsulation, only TCP and UDP; packets of the same 4-tuple on different VLANs are treated as one connection.
-- **Memory limits count payload bytes only by default.** With many tiny segments real memory is far higher. Example measurement: 500,500 segments of 40 bytes with `max_total_bytes` = 16 MiB grew memory by about 89 MiB at `segment_overhead_bytes=0`, about 27 MiB at `100`, about 21 MiB at `150`, at the price of more split streams (593, 2,162 and 2,822 streams). Measure on your own data.
+- **Memory limits add 150 bytes per buffered segment by default** (`segment_overhead_bytes`; the default was `0`, payload only, up to 0.1.x). With `0`, many tiny segments use far more memory than counted. Example measurement: 500,500 segments of 40 bytes with `max_total_bytes` = 16 MiB grew memory by about 89 MiB at `segment_overhead_bytes=0`, about 27 MiB at `100`, about 21 MiB at `150`, at the price of more split streams (593, 2,162 and 2,822 streams). Measure on your own data.
 - Not thread-safe: use one `PcapStreamProcessor` per thread. All time handling uses capture time.
 - **Untrusted captures**: set the memory limits, and limit CPU time and memory with OS or container limits. See [SECURITY.md](SECURITY.md).
 

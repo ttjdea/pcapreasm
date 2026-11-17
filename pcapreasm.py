@@ -99,15 +99,19 @@ Caveats
 from __future__ import annotations
 
 import abc
+import argparse
 import bisect
 import collections
+import datetime
 import functools
 import ipaddress
+import json
 import logging
 import os
 import re
 import socket
 import struct
+import sys
 import zlib
 from dataclasses import dataclass
 from typing import Any, BinaryIO, Callable, Dict, Iterable, List, Optional, Tuple
@@ -137,7 +141,7 @@ __all__ = [
     "EVICT_MAX_TOTAL_BYTES",
     "EVICT_FLUSH",
 ]
-__version__ = "0.1.0"
+__version__ = "0.2.0"
 
 # -------------------------------------------------------------------------
 # Constants
@@ -1269,8 +1273,9 @@ class PcapStreamProcessor:
         segment_overhead_bytes: Bytes added to the buffer accounting of every buffered
             segment, on top of its payload, when checking `max_conversation_bytes` and
             `max_total_bytes`. Many tiny segments use far more memory than their payload
-            suggests; a value around 100 makes the limits track real memory. Default 0
-            keeps the 0.0.x behaviour (payload bytes only). (Added in 0.1.0.)
+            suggests (about 110-220 bytes per segment were measured), so the default 150
+            makes the limits track real memory. Pass 0 for the 0.0.x/0.1.x behaviour
+            (payload bytes only). (Added in 0.1.0 with default 0; default 150 since 0.2.0.)
         packet_filter: Optional callable `f(ip_proto, flow_id) -> bool`, called for every
             TCP/UDP packet (after IP fragment reassembly). Return False to drop the packet
             before any stream state is created. `ip_proto` is 6 (TCP) or 17 (UDP).
@@ -1293,7 +1298,7 @@ class PcapStreamProcessor:
         fragment_timeout: float = 30.0,
         max_fragment_sets: int = 1024,
         raise_on_analyzer_error: bool = False,
-        segment_overhead_bytes: int = 0,
+        segment_overhead_bytes: int = 150,
         packet_filter: Optional[Callable[[int, FlowId], bool]] = None,
         filter_expr: Optional[str] = None,
     ):
@@ -1794,3 +1799,182 @@ class PcapStreamProcessor:
                 logger.warning("Skipping %s: %s", os.fspath(path), error)
                 if is_last:
                     self.flush()
+
+
+# -------------------------------------------------------------------------
+# Command line (`python -m pcapreasm`, added in 0.2.0)
+# -------------------------------------------------------------------------
+def _format_timestamp(timestamp_ns: int) -> str:
+    """UTC time with millisecond precision, e.g. `2026-11-16T12:34:56.789Z`."""
+    seconds, nanos = divmod(timestamp_ns, 1_000_000_000)
+    moment = datetime.datetime.fromtimestamp(seconds, datetime.timezone.utc)
+    return "%s.%03dZ" % (moment.strftime("%Y-%m-%dT%H:%M:%S"), nanos // 1_000_000)
+
+
+def _silence_stdout() -> None:
+    """After a broken pipe, point stdout at /dev/null so Python does not complain again at exit."""
+    try:
+        os.dup2(os.open(os.devnull, os.O_WRONLY), sys.stdout.fileno())
+    except (OSError, ValueError):
+        pass
+
+
+def _endpoint(host: str, port: int) -> str:
+    return "[%s]:%d" % (host, port) if ":" in host else "%s:%d" % (host, port)
+
+
+class _SummaryAnalyzer(BaseAnalyzer):
+    """Prints one line per TCP conversation and per UDP flow (used by the command line)."""
+
+    def __init__(self, out: Any, fmt: str, show_udp: bool) -> None:
+        self._out = out
+        self._json = fmt == "jsonl"
+        self._show_udp = show_udp
+        self._udp: Dict[FlowId, List[int]] = {}  # flow_id -> [datagrams, bytes, first_ns, last_ns]
+
+    def _emit(self, record: Dict[str, Any], text: str) -> None:
+        line = (json.dumps(record, ensure_ascii=False, sort_keys=True) if self._json else text) + "\n"
+        try:
+            self._out.write(line)
+        except BrokenPipeError:
+            # e.g. `| head`. SystemExit is not swallowed by the analyzer error handling.
+            _silence_stdout()
+            raise SystemExit(0) from None
+
+    def on_tcp_conversation(self, conversation: TCPConversation) -> None:
+        client, server = conversation.client, conversation.server
+        src, sport, dst, dport = client.flow_id
+        gaps = client.meta.gap_count + server.meta.gap_count
+        record: Dict[str, Any] = {
+            "type": "tcp",
+            "first": _format_timestamp(conversation.first_timestamp_ns),
+            "last": _format_timestamp(conversation.last_timestamp_ns),
+            "client": _endpoint(src, sport),
+            "server": _endpoint(dst, dport),
+            "client_bytes": len(client.data),
+            "server_bytes": len(server.data),
+            "gaps": gaps,
+            "retransmissions": client.meta.retrans_count + server.meta.retrans_count,
+            "truncated_segments": client.meta.truncated_segments + server.meta.truncated_segments,
+            "client_certain": conversation.client_certain,
+            "evict_reason": conversation.evict_reason,
+        }
+        text = "%s TCP %s -> %s c2s=%dB s2c=%dB gaps=%d end=%s%s" % (
+            record["first"], record["client"], record["server"], record["client_bytes"],
+            record["server_bytes"], gaps, conversation.evict_reason,
+            "" if conversation.client_certain else " (client/server guessed)",
+        )
+        self._emit(record, text)
+
+    def on_udp_datagram(self, flow_id: FlowId, payload: bytes, timestamp_ns: int) -> None:
+        if not self._show_udp:
+            return
+        entry = self._udp.get(flow_id)
+        if entry is None:
+            self._udp[flow_id] = [1, len(payload), timestamp_ns, timestamp_ns]
+        else:
+            entry[0] += 1
+            entry[1] += len(payload)
+            entry[3] = timestamp_ns
+
+    def on_complete(self) -> None:
+        for flow_id, (datagrams, size, first_ns, last_ns) in sorted(self._udp.items(), key=lambda item: item[1][2]):
+            src, sport, dst, dport = flow_id
+            record = {
+                "type": "udp",
+                "first": _format_timestamp(first_ns),
+                "last": _format_timestamp(last_ns),
+                "src": _endpoint(src, sport),
+                "dst": _endpoint(dst, dport),
+                "datagrams": datagrams,
+                "bytes": size,
+            }
+            self._emit(record, "%s UDP %s -> %s datagrams=%d bytes=%dB" % (
+                record["first"], record["src"], record["dst"], datagrams, size))
+
+
+def _build_argument_parser() -> "argparse.ArgumentParser":
+    parser = argparse.ArgumentParser(
+        prog="python -m pcapreasm",
+        description="Summarise the TCP conversations (and optionally UDP flows) in classic PCAP files. "
+        "Times are UTC. Output goes to stdout; statistics and warnings go to stderr.",
+    )
+    parser.add_argument("pcap", nargs="*", help="PCAP files, in chronological order (use - for stdin)")
+    parser.add_argument("-l", "--file-list", action="append", default=[], metavar="FILE",
+                        help="text file with one PCAP path per line (blank lines ignored); may be repeated")
+    parser.add_argument("-f", "--filter", dest="filter_expr", metavar="EXPR",
+                        help='tcpdump-style filter, e.g. "tcp and port 80"')
+    parser.add_argument("--udp", action="store_true", help="also print one line per UDP flow")
+    parser.add_argument("--format", choices=("text", "jsonl"), default="text",
+                        help="output format (default: text)")
+    parser.add_argument("--on-error", choices=("raise", "skip"), default="raise",
+                        help="what to do with an unreadable file (default: raise = stop with exit code 1)")
+    parser.add_argument("--idle-timeout", type=float, default=300.0, metavar="SEC",
+                        help="finish a TCP conversation idle for SEC seconds of capture time (default: 300, 0 = off)")
+    parser.add_argument("--max-memory-mb", type=int, default=1024, metavar="MB",
+                        help="buffer limit; the oldest conversations are finished first (default: 1024, 0 = off)")
+    parser.add_argument("--max-conversations", type=int, default=5000, metavar="N",
+                        help="max simultaneously tracked TCP conversations (default: 5000)")
+    parser.add_argument("--no-fragments", action="store_true", help="do not reassemble IP fragments")
+    parser.add_argument("--stats", action="store_true", help="print processing statistics to stderr")
+    parser.add_argument("-v", "--verbose", action="store_true", help="verbose logging")
+    parser.add_argument("--version", action="version", version="pcapreasm " + __version__)
+    return parser
+
+
+def main(argv: Optional[List[str]] = None) -> int:
+    """Command line entry point. Returns the process exit code (0 ok, 1 runtime error, 2 usage error)."""
+    parser = _build_argument_parser()
+    args = parser.parse_args(argv)
+
+    logging.basicConfig(
+        stream=sys.stderr,
+        level=logging.INFO if args.verbose else logging.WARNING,
+        format="[%(levelname)s] %(message)s",
+    )
+
+    paths: List[str] = list(args.pcap)
+    try:
+        for list_path in args.file_list:
+            with open(list_path, "r", encoding="utf-8", errors="surrogateescape") as handle:
+                paths.extend(line.rstrip("\r\n") for line in handle if line.strip())
+    except OSError as error:
+        print("Error: %s" % error, file=sys.stderr)
+        return 1
+    if not paths:
+        parser.error("no PCAP files given")
+    if args.idle_timeout < 0 or args.max_memory_mb < 0 or args.max_conversations < 1:
+        parser.error("--idle-timeout and --max-memory-mb must be >= 0, --max-conversations >= 1")
+
+    out = sys.stdout
+    try:
+        processor = PcapStreamProcessor(
+            analyzers=[_SummaryAnalyzer(out, args.format, args.udp)],
+            max_conversations=args.max_conversations,
+            idle_timeout=args.idle_timeout or None,
+            max_total_bytes=(args.max_memory_mb << 20) or None,
+            reassemble_fragments=not args.no_fragments,
+            filter_expr=args.filter_expr,
+        )
+    except FilterSyntaxError as error:
+        parser.error("invalid filter: %s" % error)
+
+    try:
+        if paths == ["-"]:
+            processor.process_stream(sys.stdin.buffer, name="<stdin>")
+        else:
+            processor.process_files(paths, on_error=args.on_error)
+        out.flush()
+    except BrokenPipeError:
+        _silence_stdout()
+        return 0
+    except (OSError, ValueError) as error:  # unreadable file, not a classic PCAP
+        print("Error: %s" % error, file=sys.stderr)
+        return 1
+    if args.stats or args.verbose:
+        print("[stats] %s" % dict(sorted(processor.stats.items())), file=sys.stderr)
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
