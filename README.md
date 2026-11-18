@@ -254,8 +254,8 @@ zcat capture.pcap.gz | python -m pcapreasm -
 | `-l`, `--file-list FILE` | 1 行 1 ファイルのリスト(空行は無視)。複数指定可 |
 | `-f`, `--filter EXPR` | tcpdump 式のフィルタ(「6. フィルタ式」)。式が誤っていれば終了コード 2 |
 | `--udp` | UDP フロー(送信元・宛先ごとのデータグラム数とバイト数)も表示 |
-| `--format text|jsonl` | 出力形式(既定 `text`)。`jsonl` は 1 行 1 JSON |
-| `--on-error raise|skip` | 読めないファイルがあったとき、止める(既定)/ 飛ばして続ける |
+| `--format text\|jsonl` | 出力形式(既定 `text`)。`jsonl` は 1 行 1 JSON |
+| `--on-error raise\|skip` | 読めないファイルがあったとき、止める(既定)/ 飛ばして続ける |
 | `--idle-timeout SEC` | 無通信の会話を確定するまでの秒数(既定 300、`0` で無効) |
 | `--max-memory-mb MB` | 保持するバッファの上限(既定 1024、`0` で無制限) |
 | `--max-conversations N` | 同時に保持する TCP 会話数(既定 5000) |
