@@ -111,8 +111,8 @@ One line per TCP conversation (and per UDP flow with `--udp`), times in UTC:
 | `-l`, `--file-list FILE` | file with one path per line (blank lines ignored); repeatable |
 | `-f`, `--filter EXPR` | tcpdump-style filter (see "Filter expressions"); a bad expression exits with 2 |
 | `--udp` | also print UDP flows (datagram and byte counts per source/destination) |
-| `--format text|jsonl` | output format (default `text`) |
-| `--on-error raise|skip` | stop (default) or skip an unreadable file |
+| `--format text\|jsonl` | output format (default `text`) |
+| `--on-error raise\|skip` | stop (default) or skip an unreadable file |
 | `--idle-timeout SEC` | finish a conversation idle for SEC seconds of capture time (default 300, `0` = off) |
 | `--max-memory-mb MB` | buffer limit (default 1024, `0` = unlimited) |
 | `--max-conversations N` | simultaneously tracked TCP conversations (default 5000) |
